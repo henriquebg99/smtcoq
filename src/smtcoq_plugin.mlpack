@@ -31,6 +31,10 @@ VeritSyntax
 VeritParser
 VeritLexer
 
+Z3Syntax
+Z3Parser
+Z3Lexer
+
 Shashcons
 Hstring
 Type
@@ -47,6 +51,8 @@ Smtlib2_genConstr
 SmtCommands
 
 Verit
+
+Z3
 
 Lfsc
 

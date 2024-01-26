@@ -180,6 +180,18 @@ Tactic Notation "verit" constr(h) :=
          [ .. | verit_bool_base_auto hs; vauto ]
   ]) h)) in tac h.
 
+
+Tactic Notation "z3" :=
+  ltac2:(intros ; get_hyps_cont_ltac1 ltac1:(Hs |-
+  add_compdecs Hs;
+  [ .. | prop2bool;
+         lazymatch Hs with
+         | Some ?Hs => prop2bool_hyps Hs
+         | None => idtac
+         end;
+         [ .. | verit_bool_base_auto Hs; vauto ]
+  ])).
+
 Tactic Notation "verit"           :=
   ltac2:(intros ; get_hyps_cont_ltac1 ltac1:(Hs |-
   add_compdecs Hs;
