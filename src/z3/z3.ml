@@ -251,5 +251,3 @@ let tactic_gen vm_cast timeout lcpl lcepl =
   SmtCommands.tactic 0 (call_verit timeout) verit_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl
 let tactic = tactic_gen vm_cast_true
 let tactic_no_check = tactic_gen (fun _ -> vm_cast_true_no_check)
-
-let change () = CoqInterface.tclIDTAC
