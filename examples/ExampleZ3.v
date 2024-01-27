@@ -35,7 +35,7 @@ Local Open Scope farray_scope.
 
 Goal forall a b c, ((a || b || c) && ((negb a) || (negb b) || (negb c)) && ((negb a) || b) && ((negb b) || c) && ((negb c) || a)) = false.
 Proof.
-  z3.
+  z3_verify.
   verit_bool.
 Qed.
 

@@ -30,3 +30,5 @@ val import_trace :
   string ->
   (SmtAtom.Form.t SmtCertif.clause * SmtAtom.Form.t) option ->
   SmtAtom.Form.t list -> int * SmtAtom.Form.t SmtCertif.clause
+
+val verify : unit -> CoqInterface.tactic

@@ -251,3 +251,93 @@ let tactic_gen vm_cast timeout lcpl lcepl =
   SmtCommands.tactic 0 (call_verit timeout) verit_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl
 let tactic = tactic_gen vm_cast_true
 let tactic_no_check = tactic_gen (fun _ -> vm_cast_true_no_check)
+
+
+(* ************* *)
+(* Verify tactic *)
+(* ************* *)
+
+let export_mock out_channel =
+  let fmt = Format.formatter_of_out_channel out_channel in
+
+  Format.fprintf fmt "(set-option :solver.proof.log proof_log.smt2)@.";
+  Format.fprintf fmt "(set-option :produce-proofs true)@.";
+  
+  Format.fprintf fmt "(define-fun-rec append ((l (List Int)) (s (List Int))) (List Int)@.";
+  Format.fprintf fmt "(ite (= nil l)@.";
+  Format.fprintf fmt "s@.";
+  Format.fprintf fmt "(insert (head l) (append (tail l) s))@.";
+  Format.fprintf fmt "))@.";
+(*
+  Format.fprintf fmt "(define-fun-rec reverse ((l (List Int))) (List Int)@.";
+  Format.fprintf fmt "(ite (= nil l)@.";
+  Format.fprintf fmt "l@.";
+  Format.fprintf fmt "(append (reverse (tail l))@.";
+  Format.fprintf fmt "(insert (head l) nil))@.";
+	Format.fprintf fmt "))@.";
+*)
+  Format.fprintf fmt "(declare-const l1 (List Int))@.";
+  Format.fprintf fmt "(declare-const l2 (List Int))@.";
+  Format.fprintf fmt "(assert (= (append (reverse l1) l2) nil))@.";
+  Format.fprintf fmt "(assert (or (not (= l1 nil)) (not (= l2 nil))))@.";
+  
+  Format.fprintf fmt "(check-sat)\n(exit)@."
+
+let verify () =
+  let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
+  export_mock outchan;
+  close_out outchan;
+  (* let logfilename = Filename.chop_extension filename ^ ".vtlog" in *)
+  let wname, woc = Filename.open_temp_file "warnings_z3" ".log" in
+  close_out woc;
+  let command = "z3 " ^ filename ^ " > " ^ wname in
+  Format.eprintf "%s@." command;
+  let t0 = Sys.time () in
+  let exit_code = Sys.command command in
+  let t1 = Sys.time () in
+  Format.eprintf "Verit = %.5f@." (t1-.t0);
+
+  let win = open_in wname in
+
+  let raise_warnings_errors () =
+    let answer : Z3Syntax.z3answer option ref = ref None in
+    try
+      while true do
+        let l = input_line win in
+        let n = String.length l in
+        if n >= 6 && String.sub l 0 6 = "(error" then
+          answer := (match !answer with
+                     | Some (Z3Syntax.Z3Errors es) ->  Some (Z3Syntax.Z3Errors (l :: es))
+                     | _ -> Some (Z3Syntax.Z3Errors [l]))
+        else if n >= 3 && String.sub l 0 3 = "sat" then
+          match !answer with
+          | Some (Z3Syntax.Z3Errors es) -> ()
+          | _ -> answer := Some Z3Syntax.Z3Sat
+        else if n >= 5 && String.sub l 0 5 = "unsat" then 
+          match !answer with
+          | Some (Z3Syntax.Z3Errors es) -> ()
+          | _ -> answer := Some Z3Syntax.Z3Unsat
+        else if n >= 7 && String.sub l 0 7 = "unknown" then 
+          match !answer with
+          | Some (Z3Syntax.Z3Errors es) -> ()
+          | _ -> answer := Some Z3Syntax.Z3Unknown
+        else
+          CoqInterface.error ("z3 failed with the error: " ^ l)
+      done;
+      !answer
+    with End_of_file -> !answer
+  in
+  if exit_code = 124 (*code for timeout*) then (close_in win; Sys.remove wname; let _ = CoqInterface.anomaly "z3 timed out" in ());
+  (* TODO confirm the exit codes *)
+  if exit_code <> 0 then CoqInterface.warning "z3-non-zero-exit-code" ("Z3.verify: command " ^ command ^ " exited with code " ^ string_of_int exit_code);
+  let answer = raise_warnings_errors () in 
+  (* let res = import_trace ra_quant rf_quant logfilename (Some first) lsmt in *)
+  close_in win; 
+    (* Sys.remove wname; *)
+  match answer with
+    (* TODO change from warning to information *)
+    | Some Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat"; CoqInterface.tclIDTAC
+    | Some Z3Syntax.Z3Sat -> CoqInterface.error ("z3 returned sat")
+    | Some Z3Syntax.Z3Unknown -> CoqInterface.error ("z3 returned unknown")
+    | Some Z3Syntax.Z3Errors l -> CoqInterface.error ("z3 returned errors:\n" ^ (String.concat "\n" l))
+    | None -> CoqInterface.error ("z3 did not return a solution")
