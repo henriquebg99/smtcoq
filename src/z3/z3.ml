@@ -107,7 +107,7 @@ let import_trace ra_quant rf_quant filename first lsmt =
        select !confl;
        occur !confl;
        (alloc !cfirst, !confl)
-    | Parsing.Parse_error -> failwith ("Verit.import_trace: parsing error line "^(string_of_int !line))
+    | Parsing.Parse_error -> failwith ("Z3.import_trace: parsing error line "^(string_of_int !line))
 
 
 let clear_all () =
@@ -158,6 +158,7 @@ let export out_channel rt ro lsmt =
     Format.fprintf fmt "(declare-sort %s 0)@." s
   ) (SmtBtype.to_list rt);
 
+  (* declare the constants to represent the quantified variables *)
   List.iter (fun (i,dom,cod,op) ->
     let s = "op_"^(string_of_int i) in
     SmtMaps.add_fun s op;
@@ -257,6 +258,7 @@ let tactic_no_check = tactic_gen (fun _ -> vm_cast_true_no_check)
 (* Verify tactic *)
 (* ************* *)
 
+(*
 let export_mock out_channel =
   let fmt = Format.formatter_of_out_channel out_channel in
 
@@ -268,26 +270,30 @@ let export_mock out_channel =
   Format.fprintf fmt "s@.";
   Format.fprintf fmt "(insert (head l) (append (tail l) s))@.";
   Format.fprintf fmt "))@.";
-(*
+
   Format.fprintf fmt "(define-fun-rec reverse ((l (List Int))) (List Int)@.";
   Format.fprintf fmt "(ite (= nil l)@.";
   Format.fprintf fmt "l@.";
   Format.fprintf fmt "(append (reverse (tail l))@.";
   Format.fprintf fmt "(insert (head l) nil))@.";
 	Format.fprintf fmt "))@.";
-*)
+
   Format.fprintf fmt "(declare-const l1 (List Int))@.";
   Format.fprintf fmt "(declare-const l2 (List Int))@.";
   Format.fprintf fmt "(assert (= (append (reverse l1) l2) nil))@.";
   Format.fprintf fmt "(assert (or (not (= l1 nil)) (not (= l2 nil))))@.";
   
   Format.fprintf fmt "(check-sat)\n(exit)@."
+*)
 
-let verify () =
+(* return unit in case of success (unsat) or raises exception *)
+let call_z3_verify timeout _ _ rt ro ra_quant rf_quant first lsmt : unit =
   let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
-  export_mock outchan;
+  (* export_mock outchan; *)
+  export outchan rt ro lsmt;
   close_out outchan;
   (* let logfilename = Filename.chop_extension filename ^ ".vtlog" in *)
+  (* let logfilename = "proof_log.smt2" in *)
   let wname, woc = Filename.open_temp_file "warnings_z3" ".log" in
   close_out woc;
   let command = "z3 " ^ filename ^ " > " ^ wname in
@@ -331,13 +337,133 @@ let verify () =
   (* TODO confirm the exit codes *)
   if exit_code <> 0 then CoqInterface.warning "z3-non-zero-exit-code" ("Z3.verify: command " ^ command ^ " exited with code " ^ string_of_int exit_code);
   let answer = raise_warnings_errors () in 
-  (* let res = import_trace ra_quant rf_quant logfilename (Some first) lsmt in *)
+  (*let res = import_trace ra_quant rf_quant logfilename (Some first) lsmt in*)
   close_in win; 
     (* Sys.remove wname; *)
-  match answer with
+  (match answer with
     (* TODO change from warning to information *)
-    | Some Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat"; CoqInterface.tclIDTAC
+    | Some Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat" (*;  CoqInterface.tclIDTAC *)
     | Some Z3Syntax.Z3Sat -> CoqInterface.error ("z3 returned sat")
     | Some Z3Syntax.Z3Unknown -> CoqInterface.error ("z3 returned unknown")
     | Some Z3Syntax.Z3Errors l -> CoqInterface.error ("z3 returned errors:\n" ^ (String.concat "\n" l))
-    | None -> CoqInterface.error ("z3 did not return a solution")
+    | None -> CoqInterface.error ("z3 did not return a solution"))
+  ;
+  ()(*res*)
+
+let tactic_gen' vm_cast timeout lcpl lcepl =
+  (* Transform the tuple of lemmas given by the user into a list *)
+  let lcpl =
+    let lcpl = EConstr.Unsafe.to_constr lcpl in
+    let lcpl = CoqTerms.option_of_constr_option lcpl in
+    match lcpl with
+      | Some lcpl -> CoqTerms.list_of_constr_tuple lcpl
+      | None -> []
+  in
+
+  (* Core tactic *)
+  clear_all ();
+  let rt = SmtBtype.create () in
+  let ro = Op.create () in
+  let ra = VeritSyntax.ra in
+  let rf = VeritSyntax.rf in
+  let ra_quant = VeritSyntax.ra_quant in
+  let rf_quant = VeritSyntax.rf_quant in
+  SmtCommands.tactic' 0 (call_z3_verify timeout) verit_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl
+  (*call_z3_verify timeout verit_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl*)
+
+let tactic' = tactic_gen' vm_cast_true
+(* let tactic_no_check' = tactic_gen (fun _ -> vm_cast_true_no_check) *)
+
+let show_hyps (hyps: EConstr.named_context) : string =
+  "there are " ^ string_of_int (List.length hyps) ^ " hyps"
+
+let show_env (env: Environ.env) : string = ""
+
+(* converts a constr to Z3 expression 
+   * rels is the list of names of variables to replace de Brujin indices 
+   * a name in position i - 1 should replace (Constr.Rel i)*)
+let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string =
+  match Constr.kind c with
+  | Constr.App (c, arr) -> 
+      let args_str = Array.fold_right (fun c r -> constr_to_z3 c e rels ^ " " ^ r) arr "" in
+      "(" ^ constr_to_z3 c e rels ^ " " ^ args_str ^ ")"
+  | Constr.Prod (n, t1, t2) ->  
+      begin match (Context.binder_name n) with
+      (* the variable of forall is _, so treat as implication *)
+      | Names.Name.Anonymous -> 
+          "(implies " ^ constr_to_z3 t1 e rels ^ " " ^ constr_to_z3 t2 e rels ^ ")"
+      (* the variable has a name *)
+      | Names.Name.Name id ->
+          (* z3 does not support quantification over props *)
+          if Constr.is_Prop t1 
+            then failwith "quantification over props is not supported"
+            else 
+              let name = Names.Id.to_string id in 
+              let t1' = constr_to_z3 t1 e rels in
+              let t2' = constr_to_z3 t2 e (name :: rels) in
+              "(forall ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")"
+      end
+  | Constr.LetIn (n, t1, _, t2) ->
+      begin match (Context.binder_name n) with
+      (* the variable of forall is _, so treat as implication *)
+      | Names.Name.Anonymous -> failwith "let with anonymous binding"
+      (* the variable has a name *)
+      | Names.Name.Name id ->
+          (* z3 does not support quantification over props *)
+          if Constr.is_Prop t1 
+            then failwith "let with prop is not supported"
+            else 
+              let name = Names.Id.to_string id in
+              let t1' = constr_to_z3 t1 e rels in
+              let t2' = constr_to_z3 t2 e (name :: rels) in
+              "(let ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")" 
+      end
+  | Constr.Lambda (n, tn, t1) ->
+      begin match (Context.binder_name n) with
+      | Names.Name.Anonymous -> 
+          let name = "_" in
+          let tn' = constr_to_z3 tn e rels in
+          let t1' = constr_to_z3 t1 e (name :: rels) in 
+          "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
+      | Names.Name.Name id ->
+          let name = Names.Id.to_string id in
+          let tn' = constr_to_z3 tn e rels in
+          let t1' = constr_to_z3 t1 e (name :: rels) in 
+          "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
+      end
+  | Constr.Var id -> Names.Id.to_string id
+  | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind
+  | Constr.Const (name, univ) -> 
+      begin match (Environ.lookup_constant name e).Declarations.const_body with
+      | Declarations.Def d -> Names.Constant.to_string name
+      | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
+      end
+  | Constr.Construct (((mutind, _), index), univ) -> 
+      Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
+  | Constr.Case (ci, constr, inv, constr2, arr) -> 
+    let branch_str = Array.fold_right (fun c r -> constr_to_z3 c e rels ^ " ;; " ^ r) arr "" in
+      "(match " ^ constr_to_z3 constr2 e rels ^  "with" ^ branch_str ^ ")"
+  | Constr.Rel i -> List.nth rels (i - 1)
+  | Constr.Fix _ -> "(fix)"
+  | _ -> "(ERROR)"
+
+let print_type () = 
+  Proofview.Goal.enter (fun gl ->
+    
+    (* envienvironment with global definitions, etc. *)
+    let env = Proofview.Goal.env gl in
+    
+    (* existential variables (evars) map *)
+    let sigma = Tacmach.New.project gl in
+    
+    (* conclusion of the goal *)
+    let t = Proofview.Goal.concl gl in
+    
+    (* convert from EConstr (with evars) to Constr (no evars) *)
+    let t = EConstr.to_constr sigma t in (* The goal should not contain uninstanciated evars *)
+
+    (* get hypothesis *)
+    let hyps = Proofview.Goal.hyps gl in 
+
+    failwith ("Conversion: " ^ constr_to_z3 t env [] ^ "\nHyps: " ^ show_hyps hyps ^ "env " ^ show_env env)
+  )

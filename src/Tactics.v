@@ -94,6 +94,8 @@ End Test.  *)
 Tactic Notation "verit_bool_base_auto" constr(h) := verit_bool_base h; try (exact _).
 Tactic Notation "verit_bool_no_check_base_auto" constr(h) := verit_bool_no_check_base h; try (exact _).
 
+Tactic Notation "z3_bool_base_auto" constr(h) := z3_bool_base h; try (exact _).
+
 Tactic Notation "verit_bool" constr(h) :=
   let tac :=
   ltac2:(h |- get_hyps_cont_ltac1
@@ -106,6 +108,9 @@ Tactic Notation "verit_bool" constr(h) :=
 
 Tactic Notation "verit_bool" :=
   ltac2:(get_hyps_cont_ltac1 ltac1:(hs |- verit_bool_base_auto hs; vauto)).
+
+Tactic Notation "z3_bool" :=
+  ltac2:(get_hyps_cont_ltac1 ltac1:(hs |- z3_bool_base_auto hs; vauto)).
 
 Tactic Notation "verit_bool_no_check" constr(h) :=
   let tac :=

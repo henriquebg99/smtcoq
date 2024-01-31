@@ -16,6 +16,8 @@
    *)
 Require Import SMTCoq.SMTCoq.
 Require Import Bool.
+Require Coq.Lists.List.
+Require Import Coq.Strings.String.
 
 Require Import ZArith.
 
@@ -25,7 +27,22 @@ Local Open Scope bv_scope.
 Import FArray.
 Local Open Scope farray_scope.
 
+(*
+Ltac everyone k :=
+let rec f acc :=
+match goal with
+| [ H : ?T |- _ ] => generalize dependent H; f (@cons Type T acc)
+| _ => k acc
+end in
+f (@nil Type).
 
+
+Ltac pose_all  := intros; everyone ltac:(fun x => pose x).
+
+Goal forall x y z : nat, x = y -> y = z -> x = z.
+ pose_all.
+Admitted.
+*)
 (* Examples of the verit tactics (requires verit in your PATH environment
    variable), which handle
    - propositional logic
@@ -33,8 +50,26 @@ Local Open Scope farray_scope.
    - linear integer arithmetic
    - universally quantified hypotheses *)
 
+(*Axiom myax : forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
+
+Theorem mytheo : forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
+Proof. apply myax. Qed.
+*)
+(* Goal match Some I with 
+     | Some v => False
+     | None => True
+     end. *)
+Goal forall y, y = 0 \/ forall x,  x < y + 1.
+Proof. intros. print_type.
+Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
+Proof.
+  z3_bool.
+
 Goal forall a b c, ((a || b || c) && ((negb a) || (negb b) || (negb c)) && ((negb a) || b) && ((negb b) || c) && ((negb c) || a)) = false.
 Proof.
+  z3_bool.
+  verit_bool.
+  z3_bool.
   z3_verify.
   verit_bool.
 Qed.
