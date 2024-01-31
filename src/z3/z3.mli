@@ -31,4 +31,7 @@ val import_trace :
   (SmtAtom.Form.t SmtCertif.clause * SmtAtom.Form.t) option ->
   SmtAtom.Form.t list -> int * SmtAtom.Form.t SmtCertif.clause
 
-val verify : unit -> CoqInterface.tactic
+(* val verify : unit -> CoqInterface.tactic *)
+val tactic' : int option -> EConstr.t -> CoqInterface.constr_expr list -> CoqInterface.tactic
+
+val print_type : unit -> CoqInterface.tactic

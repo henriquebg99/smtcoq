@@ -662,8 +662,22 @@ let get_arguments concl =
   match args with
   | [ty;a;b] when (CoqInterface.eq_constr f (Lazy.force ceq)) && (CoqInterface.eq_constr ty (Lazy.force cbool)) -> a, b
   | [a] when (CoqInterface.eq_constr f (Lazy.force cis_true)) -> a, Lazy.force ctrue
-  | _ -> failwith ("Verit.tactic: can only deal with equality over bool")
+  | _ -> failwith (": can only deal with equality over bool")
 
+(* let decomp_term sigma (c : Constr.t) =
+  Constr.kind (EConstr.Unsafe.to_constr (Termops.strip_outer_cast sigma (EConstr.of_constr c))) *)
+
+let constr_to_string (concl: Constr.t) sigma =
+  (* let t = decomp_term sigma concl in *)
+  let k = Constr.kind concl in
+  begin match k with
+  | Constr.App (c, [|typ; tl; tr|]) -> failwith ("app")
+  | Constr.Prod (n, t1, t2) -> failwith ("forall")
+  | Constr.LetIn (n, tn, t1, t2) -> failwith ("let")
+  | Constr.Lambda (n, tn, t1) -> failwith ("fun")
+  (*| Constr.Case (ci,u,params,p,iv,c,brs) -> failwith ("match")*)
+  | _ -> () (* failwith (Pp.db_string_of_pp (Constr.debug_print concl)) *)
+  end; ()
 
 let make_proof i call_solver env rt ro ra_quant rf_quant l ls_smtc =
   let root = SmtTrace.mkRootV [l] in
@@ -806,6 +820,101 @@ let tactic call_solver i solver_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl
     Tactics.intros
     (CoqInterface.mk_tactic (core_tactic call_solver i solver_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl))
 
+
+(* BEGIN Z3 !! *)
+let make_proof' i call_solver env rt ro ra_quant rf_quant l ls_smtc =
+  let root = SmtTrace.mkRootV [l] in
+  call_solver i env rt ro ra_quant rf_quant (root,l) ls_smtc
+
+let core_tactic' call_solver i solver_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl env sigma concl =
+  let _ = constr_to_string concl sigma in 
+  let a, b = get_arguments concl in
+
+  let tlcepl = List.map (CoqInterface.interp_constr env sigma) lcepl in
+  let lcpl = lcpl @ tlcepl in
+
+  let create_lemma l =
+    let cl = CoqInterface.retyping_get_type_of env sigma l in
+    match of_coq_lemma rt ro ra_quant rf_quant env sigma solver_logic cl with
+      | Some smt -> Some ((cl, l), smt)
+      | None -> None
+  in
+  let l_pl_ls = SmtMisc.filter_map create_lemma lcpl in
+  let lsmt = List.map snd l_pl_ls in
+
+  let lem_tbl : (int, CoqInterface.constr * CoqInterface.constr) Hashtbl.t =
+    Hashtbl.create 100
+  in
+  let new_ref ((l, pl), ls) =
+    Hashtbl.add lem_tbl (Form.index ls) (l, pl)
+  in
+
+  List.iter new_ref l_pl_ls;
+
+  (*let find_lemma cl =
+    let re_hash hf = Form.hash_hform (Atom.hash_hatom ra_quant) rf_quant hf in
+    match cl.value with
+    | Some [l] ->
+       let hl = re_hash l in
+       begin try Hashtbl.find lem_tbl (Form.index hl)
+             with Not_found ->
+               let oc = open_out "/tmp/find_lemma.log" in
+               let fmt = Format.formatter_of_out_channel oc in
+               List.iter (fun u -> Format.fprintf fmt "%a\n" (Form.to_smt ~debug:true) u) lsmt;
+               Format.fprintf fmt "\n%a\n" (Form.to_smt ~debug:true) hl;
+               flush oc; close_out oc; failwith "find_lemma"
+       end
+      | _ -> failwith "unexpected form of root"
+  in*)
+  try
+    (*let (body_cast, body_nocast, cuts) =*)
+    let _ = 
+      if ((CoqInterface.eq_constr b (Lazy.force ctrue)) ||
+          (CoqInterface.eq_constr b (Lazy.force cfalse))) then 
+          begin 
+            let l = Form.of_coq (Atom.of_coq rt ro ra solver_logic env sigma) rf a in
+            let _ = Form.of_coq (Atom.of_coq ~eqsym:true rt ro ra_quant solver_logic env sigma) rf_quant a in
+            let nl = if (CoqInterface.eq_constr b (Lazy.force ctrue)) then Form.neg l else l in
+            let lsmt = Form.flatten rf nl :: lsmt in
+            (* let max_id_confl = make_proof call_solver i env rt ro ra_quant rf_quant nl lsmt in *)
+            make_proof' call_solver i env rt ro ra_quant rf_quant nl lsmt
+            (* build_body rt ro ra rf (Form.to_coq l) b max_id_confl (vm_cast env) (Some find_lemma) *)
+          end
+       else begin
+        let l1 = Form.of_coq (Atom.of_coq rt ro ra solver_logic env sigma) rf a in
+        let _ = Form.of_coq (Atom.of_coq ~eqsym:true rt ro ra_quant solver_logic env sigma) rf_quant a in
+        let l2 = Form.of_coq (Atom.of_coq rt ro ra solver_logic env sigma) rf b in
+        let _ = Form.of_coq (Atom.of_coq ~eqsym:true rt ro ra_quant solver_logic env sigma) rf_quant b in
+        let l = Form.get rf (Fapp(Fiff,[|l1;l2|])) in
+        let nl = Form.neg l in
+        let lsmt = Form.flatten rf nl :: lsmt in
+        (* let max_id_confl = make_proof call_solver i env rt ro ra_quant rf_quant nl lsmt in *)
+        make_proof' call_solver i env rt ro ra_quant rf_quant nl lsmt
+        (* build_body_eq rt ro ra rf (Form.to_coq l1) (Form.to_coq l2)
+          (Form.to_coq nl) max_id_confl (vm_cast env) (Some find_lemma) ) in *)
+      end
+
+    (* let cuts = (SmtBtype.get_cuts rt) @ cuts in
+
+    List.fold_right (fun (eqn, eqt) tac ->
+        CoqInterface.tclTHENLAST
+          (CoqInterface.assert_before (CoqInterface.name_of_id eqn) eqt)
+          tac
+      ) cuts
+      (CoqInterface.tclTHEN
+         (CoqInterface.set_evars_tac body_nocast)
+         (CoqInterface.vm_cast_no_check body_cast))) *)
+      in CoqInterface.tclIDTAC
+  with
+  | DoNothing -> CoqInterface.tclIDTAC
+
+
+let tactic' call_solver i solver_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl =
+    CoqInterface.tclTHEN
+      Tactics.intros
+      (CoqInterface.mk_tactic (core_tactic' call_solver i solver_logic rt ro ra rf ra_quant rf_quant vm_cast lcpl lcepl))
+  
+(* END Z3 !! *)
 
 (**********************************************)
 (* Show solver models as Coq counter-examples *)
