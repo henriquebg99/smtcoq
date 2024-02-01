@@ -59,7 +59,8 @@ Proof. apply myax. Qed.
      | Some v => False
      | None => True
      end. *)
-Goal forall y, y = 0 \/ forall x,  x < y + 1.
+(* Goal forall y, y = 0 \/ forall x,  x < y + 1. *)
+Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
 Proof. intros. print_type.
 Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
 Proof.

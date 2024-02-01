@@ -374,10 +374,13 @@ let tactic_gen' vm_cast timeout lcpl lcepl =
 let tactic' = tactic_gen' vm_cast_true
 (* let tactic_no_check' = tactic_gen (fun _ -> vm_cast_true_no_check) *)
 
-let show_hyps (hyps: EConstr.named_context) : string =
-  "there are " ^ string_of_int (List.length hyps) ^ " hyps"
-
-let show_env (env: Environ.env) : string = ""
+(* use z3 logic instead of defining inductive types for trival aspects *)
+module M = Map.Make (String)
+let special_inductives = M.of_seq (List.to_seq [
+  ("Coq.Init.Logic.eq", "=");
+  ("Coq.Init.Logic.and", "and");
+  ("Coq.Init.Logic.or", "or");
+])
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
@@ -385,7 +388,8 @@ let show_env (env: Environ.env) : string = ""
 let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string =
   match Constr.kind c with
   | Constr.App (c, arr) -> 
-      let args_str = Array.fold_right (fun c r -> constr_to_z3 c e rels ^ " " ^ r) arr "" in
+      let args_str = String.concat " " (Array.to_list 
+          (Array.map (fun c -> constr_to_z3 c e rels) arr)) in
       "(" ^ constr_to_z3 c e rels ^ " " ^ args_str ^ ")"
   | Constr.Prod (n, t1, t2) ->  
       begin match (Context.binder_name n) with
@@ -420,7 +424,11 @@ let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string
       end
   | Constr.Lambda (n, tn, t1) ->
       begin match (Context.binder_name n) with
-      | Names.Name.Anonymous -> failwith "processing lambda with wildcard parameter"
+      | Names.Name.Anonymous -> 
+          let name = "_" in
+          let tn' = constr_to_z3 tn e rels in
+          let t1' = constr_to_z3 t1 e (name :: rels) in 
+          "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
       | Names.Name.Name id ->
           let name = Names.Id.to_string id in
           let tn' = constr_to_z3 tn e rels in
@@ -431,17 +439,106 @@ let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string
   | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind
   | Constr.Const (name, univ) -> 
       begin match (Environ.lookup_constant name e).Declarations.const_body with
-      | Declarations.Def d -> Names.Constant.to_string name
+      | Declarations.Def d ->
+          let name_str = Names.Constant.to_string name in
+          Option.default name_str (M.find_opt name_str special_inductives)
       | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
       end
   | Constr.Construct (((mutind, _), index), univ) -> 
-      "constructor " ^ string_of_int index ^ " of " ^ Names.MutInd.to_string mutind
+      Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
   | Constr.Case (ci, constr, inv, constr2, arr) -> 
     let branch_str = Array.fold_right (fun c r -> constr_to_z3 c e rels ^ " ;; " ^ r) arr "" in
       "(match " ^ constr_to_z3 constr2 e rels ^  "with" ^ branch_str ^ ")"
   | Constr.Rel i -> List.nth rels (i - 1)
   | Constr.Fix _ -> "(fix)"
   | _ -> "(ERROR)"
+
+let call_z3 (script: string) : Z3Syntax.z3answer =
+    let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
+    Printf.fprintf outchan "%s\n" script;  
+    close_out outchan;
+
+    (* let logfilename = Filename.chop_extension filename ^ ".vtlog" in *)
+    (* let logfilename = "proof_log.smt2" in *)
+    let wname, woc = Filename.open_temp_file "warnings_z3" ".log" in
+    close_out woc;
+    let command = "z3 " ^ filename ^ " > " ^ wname in
+    Format.eprintf "%s@." command;
+    let t0 = Sys.time () in
+    let exit_code = Sys.command command in
+    let t1 = Sys.time () in
+    Format.eprintf "z3 = %.5f@." (t1-.t0);
+  
+    let win = open_in wname in
+  
+    let raise_warnings_errors () =
+      let answer : Z3Syntax.z3answer option ref = ref None in
+      try
+        while true do
+          let l = input_line win in
+          let n = String.length l in
+          if n >= 6 && String.sub l 0 6 = "(error" then
+            answer := (match !answer with
+                       | Some (Z3Syntax.Z3Errors es) ->  Some (Z3Syntax.Z3Errors (l :: es))
+                       | _ -> Some (Z3Syntax.Z3Errors [l]))
+          else if n >= 3 && String.sub l 0 3 = "sat" then
+            match !answer with
+            | Some (Z3Syntax.Z3Errors es) -> ()
+            | _ -> answer := Some Z3Syntax.Z3Sat
+          else if n >= 5 && String.sub l 0 5 = "unsat" then 
+            match !answer with
+            | Some (Z3Syntax.Z3Errors es) -> ()
+            | _ -> answer := Some Z3Syntax.Z3Unsat
+          else if n >= 7 && String.sub l 0 7 = "unknown" then 
+            match !answer with
+            | Some (Z3Syntax.Z3Errors es) -> ()
+            | _ -> answer := Some Z3Syntax.Z3Unknown
+          else
+            CoqInterface.error ("z3 failed with the error: " ^ l)
+        done;
+        !answer
+      with End_of_file -> !answer
+    in
+    (* TODO confirm the exit codes *)
+    if exit_code <> 0 then CoqInterface.warning "z3-non-zero-exit-code" ("Z3.verify: command " ^ command ^ " exited with code " ^ string_of_int exit_code);
+    let answer = raise_warnings_errors () in 
+    (*let res = import_trace ra_quant rf_quant logfilename (Some first) lsmt in*)
+    close_in win; 
+      (* Sys.remove wname; *)
+    match answer with
+      | Some r -> r
+      | None -> CoqInterface.error ("z3 did not return a solution")
+
+let hyp_to_z3_assert (sigma: Evd.evar_map)
+                     (e: Environ.env)                     
+                     hyp : string =
+  match hyp with
+  | Context.Named.Declaration.LocalAssum (hname, hyp_econstr) ->
+      let hyp_ty = EConstr.to_constr sigma (snd (Typing.type_of e sigma hyp_econstr)) in
+      let hyp_constr = EConstr.to_constr sigma hyp_econstr in
+      let name_str = Names.Id.to_string (Context.binder_name hname) in
+      
+      if Constr.is_Prop hyp_ty then
+        "(assert " ^ constr_to_z3 hyp_constr e [] ^ ")"
+      
+      else if Constr.is_Set hyp_constr || Constr.is_Type hyp_constr then
+        "(declare-sort " ^ name_str ^ ")"
+
+      else
+        "(declare-const " ^ name_str ^ " " ^ constr_to_z3 hyp_constr e []  ^ ")" 
+      
+  | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
+
+let types_and_funcs () =
+  "(declare-datatypes (T) (\n" ^
+    "(Coq.Init.Datatypes.list \n" ^
+	    "Coq.Init.Datatypes.list_c1 \n"  ^ 
+	    "(Coq.Init.Datatypes.list_c2 \n" ^
+            "(head T) \n" ^
+            "(tail Coq.Init.Datatypes.list)\n" ^
+       ")\n" ^
+    ")\n" ^
+"))"
 
 let print_type () = 
   Proofview.Goal.enter (fun gl ->
@@ -461,5 +558,15 @@ let print_type () =
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
 
-    failwith ("Conversion: " ^ constr_to_z3 t env [] ^ "\nHyps: " ^ show_hyps hyps ^ "env " ^ show_env env)
+    let goal_z3 = "(assert " ^ constr_to_z3 t env [] ^ ")" in 
+    let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
+    let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
+
+    match call_z3 script with
+    | Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat" ;  CoqInterface.tclIDTAC
+    | Z3Syntax.Z3Sat -> CoqInterface.error ("z3 returned sat")
+    | Z3Syntax.Z3Unknown -> CoqInterface.error ("z3 returned unknown")
+    | Z3Syntax.Z3Errors l -> CoqInterface.error ("z3 returned errors:\n" ^ (String.concat "\n" l))
+
+    (* failwith ("Conversion: " ^ constr_to_z3 t env [] ^ "\nHyps: " ^ show_hyps hyps ^ "env " ^ show_env env) *)
   )
