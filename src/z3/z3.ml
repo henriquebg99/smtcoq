@@ -382,20 +382,109 @@ let special_inductives = M.of_seq (List.to_seq [
   ("Coq.Init.Logic.or", "or");
 ])
 
+let special_funcs = M.of_seq (List.to_seq [
+])
+
+(* returns the type of a construction *)
+let constr_type (c: Constr.t) 
+                (e: Environ.env) 
+                (sigma: Evd.evar_map) : Constr.types =
+  EConstr.to_constr sigma (
+    snd (Typing.type_of e sigma (EConstr.of_constr c)))
+
+(* extract return type of a type, expects Sort, Ind, Arrow. App (e.g. list nat), not dependent type *)
+let rec return_type (t: Constr.types) : Constr.types =
+  match Constr.kind t with
+  | Constr.Sort _ | Constr.Ind _ | Constr.App _ -> t
+  | Constr.Prod (n, _, t2) -> 
+      (*if Context.binder_name n = Names.Name.Anonymous then
+        *)return_type t2 (*
+      else
+        failwith ("does not support dependent type")*)
+  | _ -> failwith ("expected type with sort, arrow or ind")
+
+(* invariants: 
+   split_while f l = (l1, l2) -> l1 ++ l2 = l /\ f a for a in l1 and (l2 = [] or not f (hd l2))*)
+let rec split_while (f: 'a -> bool) (l: 'a list) : ('a list) * ('a list) =
+  match l with
+  | [] -> ([], [])
+  | h :: t -> if f h then let (r1, r2) = split_while f t in (h :: r1, r2) else ([], l) 
+
+(* given an array of arguments of an app, return two arrays, 
+   one with the first type arguments (for polymorphism; ignoring props) 
+   and other with the remaining args (i.e. from the first non sort or prop on);
+   if the remainig args have types (no prop) raises error*)
+let remove_initial_types_non_props (args: Constr.t list)
+                      (e: Environ.env) 
+                      (sigma: Evd.evar_map) : 
+                      (Constr.t list) = 
+  let pred a = begin let ty = constr_type a e sigma in 
+    Constr.isSort ty && (not (Constr.is_Prop ty)) end in
+  let (_, r2) = split_while pred args in
+  match List.find_opt pred r2 with
+  | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
+  | None -> r2
+ 
+(* similiar to remove_initial but also removes Props and returns the also the removed*)
+let split_inital_types (args: Constr.t list)
+                     (e: Environ.env) 
+                     (sigma: Evd.evar_map) : 
+                     (Constr.t list) * (Constr.t list) = 
+  let pred a = Constr.isSort (constr_type a e sigma) in 
+  let (r1, r2) = split_while pred args in
+  match List.find_opt pred r2 with
+  | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
+  | None -> (r1, r2)
+
+
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
    * a name in position i - 1 should replace (Constr.Rel i)*)
-let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string =
+let rec constr_to_z3 (c: Constr.t) 
+                     (e: Environ.env) 
+                     (rels: string list)
+                     (sigma: Evd.evar_map) : string =
   match Constr.kind c with
-  | Constr.App (c, arr) -> 
-      let args_str = String.concat " " (Array.to_list 
-          (Array.map (fun c -> constr_to_z3 c e rels) arr)) in
-      "(" ^ constr_to_z3 c e rels ^ " " ^ args_str ^ ")"
+  (* TODO inspect App, to check if all cases are handled properly*)
+  | Constr.App (f, arr) -> 
+      let f_ty = constr_type f e sigma in
+      let f_ret_ty = (* CoqInterface.warning "debug" (constr_to_z3 f e rels sigma) ;
+                     CoqInterface.warning "debug-ty" (constr_to_z3 f_ty e rels sigma) ; *)
+                     CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print f_ty)) ; return_type f_ty in
+      let args = Array.to_list arr in
+      (* if f return Prop (e.g. eq, and, or) *)
+      if Constr.is_Prop f_ret_ty then 
+        (* remove types e.g. eq nat n1 n2 -> eq n1 n2 *)
+        let args_no_types = remove_initial_types_non_props args e sigma in
+        begin match args_no_types with
+        | [] -> constr_to_z3 f e rels sigma
+        | _ :: _ -> 
+            let args_str = String.concat " " 
+              (List.map (fun c' -> constr_to_z3 c' e rels sigma) args_no_types) in
+            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+        end
+      (* if it is an inductive and not of type prop, then it is a "computable" datatype
+         so leave the types e.g. list nat - leave the nat *)
+      else if Constr.isInd f then
+        let args_str = String.concat " " 
+              (List.map (fun c' -> constr_to_z3 c' e rels sigma) args) in
+            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+      (* if f returns a type which is a Set, e.g. nat, list nat*)
+      else
+        let (_, args') = split_inital_types args e sigma in
+        begin match args' with
+        | [] -> constr_to_z3 f e rels sigma
+        | _ :: _ -> 
+            let args_str = String.concat " " 
+              (List.map (fun c' -> constr_to_z3 c' e rels sigma) args') in
+            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+        end
+      
   | Constr.Prod (n, t1, t2) ->  
       begin match (Context.binder_name n) with
       (* the variable of forall is _, so treat as implication *)
       | Names.Name.Anonymous -> 
-          "(implies " ^ constr_to_z3 t1 e rels ^ " " ^ constr_to_z3 t2 e rels ^ ")"
+          "(implies " ^ constr_to_z3 t1 e rels sigma ^ " " ^ constr_to_z3 t2 e rels sigma ^ ")"
       (* the variable has a name *)
       | Names.Name.Name id ->
           (* z3 does not support quantification over props *)
@@ -403,12 +492,12 @@ let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string
             then failwith "quantification over props is not supported"
             else 
               let name = Names.Id.to_string id in 
-              let t1' = constr_to_z3 t1 e rels in
-              let t2' = constr_to_z3 t2 e (name :: rels) in
+              let t1' = constr_to_z3 t1 e rels sigma in
+              let t2' = constr_to_z3 t2 e (name :: rels) sigma in
               "(forall ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")"
       end
   | Constr.LetIn (n, t1, _, t2) ->
-      begin match (Context.binder_name n) with
+      begin match (Context.binder_name n) with  
       (* the variable of forall is _, so treat as implication *)
       | Names.Name.Anonymous -> failwith "let with anonymous binding"
       (* the variable has a name *)
@@ -418,39 +507,42 @@ let rec constr_to_z3 (c: Constr.t) (e: Environ.env) (rels: string list) : string
             then failwith "let with prop is not supported"
             else 
               let name = Names.Id.to_string id in
-              let t1' = constr_to_z3 t1 e rels in
-              let t2' = constr_to_z3 t2 e (name :: rels) in
+              let t1' = constr_to_z3 t1 e rels sigma in
+              let t2' = constr_to_z3 t2 e (name :: rels) sigma in
               "(let ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")" 
       end
   | Constr.Lambda (n, tn, t1) ->
       begin match (Context.binder_name n) with
       | Names.Name.Anonymous -> 
           let name = "_" in
-          let tn' = constr_to_z3 tn e rels in
-          let t1' = constr_to_z3 t1 e (name :: rels) in 
+          let tn' = constr_to_z3 tn e rels sigma in
+          let t1' = constr_to_z3 t1 e (name :: rels) sigma in 
           "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
       | Names.Name.Name id ->
           let name = Names.Id.to_string id in
-          let tn' = constr_to_z3 tn e rels in
-          let t1' = constr_to_z3 t1 e (name :: rels) in 
+          let tn' = constr_to_z3 tn e rels sigma in
+          let t1' = constr_to_z3 t1 e (name :: rels) sigma in 
           "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
       end
   | Constr.Var id -> Names.Id.to_string id
-  | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind
+  | Constr.Ind ((mutind, _), univ) -> 
+      let name_str = Names.MutInd.to_string mutind in 
+      Option.default name_str (M.find_opt name_str special_inductives)
   | Constr.Const (name, univ) -> 
+      let name_str = Names.Constant.to_string name in
       begin match (Environ.lookup_constant name e).Declarations.const_body with
       | Declarations.Def d ->
-          let name_str = Names.Constant.to_string name in
-          Option.default name_str (M.find_opt name_str special_inductives)
-      | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
+          Option.default name_str (M.find_opt name_str special_funcs)
+      | _ -> failwith ("definition for name " ^ name_str ^ " is not available")
       end
   | Constr.Construct (((mutind, _), index), univ) -> 
       Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
   | Constr.Case (ci, constr, inv, constr2, arr) -> 
-    let branch_str = Array.fold_right (fun c r -> constr_to_z3 c e rels ^ " ;; " ^ r) arr "" in
-      "(match " ^ constr_to_z3 constr2 e rels ^  "with" ^ branch_str ^ ")"
+    let branch_str = Array.fold_right (fun c r -> constr_to_z3 c e rels sigma ^ " ;; " ^ r) arr "" in
+      "(match " ^ constr_to_z3 constr2 e rels sigma ^  "with" ^ branch_str ^ ")"
   | Constr.Rel i -> List.nth rels (i - 1)
   | Constr.Fix _ -> "(fix)"
+  | Constr.Sort _ -> "(sort)"
   | _ -> "(ERROR)"
 
 let call_z3 (script: string) : Z3Syntax.z3answer =
@@ -519,13 +611,13 @@ let hyp_to_z3_assert (sigma: Evd.evar_map)
       let name_str = Names.Id.to_string (Context.binder_name hname) in
       
       if Constr.is_Prop hyp_ty then
-        "(assert " ^ constr_to_z3 hyp_constr e [] ^ ")"
+        "(assert " ^ constr_to_z3 hyp_constr e [] sigma ^ ")"
       
       else if Constr.is_Set hyp_constr || Constr.is_Type hyp_constr then
         "(declare-sort " ^ name_str ^ ")"
 
       else
-        "(declare-const " ^ name_str ^ " " ^ constr_to_z3 hyp_constr e []  ^ ")" 
+        "(declare-const " ^ name_str ^ " " ^ constr_to_z3 hyp_constr e [] sigma  ^ ")" 
       
   | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
 
@@ -558,7 +650,7 @@ let print_type () =
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
 
-    let goal_z3 = "(assert " ^ constr_to_z3 t env [] ^ ")" in 
+    let goal_z3 = "(assert " ^ constr_to_z3 t env [] sigma ^ ")" in 
     let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
     let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
 
