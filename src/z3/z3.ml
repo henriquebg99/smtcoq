@@ -436,14 +436,22 @@ let split_inital_types (args: Constr.t list)
   | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
   | None -> (r1, r2)
 
+(* name of constant and list of types for monomorphization
+   e.g. (app, [A]) -> get a version of app for A, called app_A *)
+type pending_def = (Names.Constant.t, (Constr.t) list)
+
+(* error if one of poly args is not Ind - to simplify things *)
+let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
+  ""
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
-   * a name in position i - 1 should replace (Constr.Rel i)*)
+   * a name in position i - 1 should replace (Constr.Rel i)
+   * returns a list of pending defs that have to be defined *)
 let rec constr_to_z3 (c: Constr.t) 
                      (e: Environ.env) 
                      (rels: string list)
-                     (sigma: Evd.evar_map) : string =
+                     (sigma: Evd.evar_map) : string * (pending_def list) =
   match Constr.kind c with
   (* TODO inspect App, to check if all cases are handled properly*)
   | Constr.App (f, arr) -> 
