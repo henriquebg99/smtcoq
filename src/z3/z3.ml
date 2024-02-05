@@ -438,11 +438,38 @@ let split_inital_types (args: Constr.t list)
 
 (* name of constant and list of types for monomorphization
    e.g. (app, [A]) -> get a version of app for A, called app_A *)
-type pending_def = (Names.Constant.t, (Constr.t) list)
+(* type pending_def = Names.Constant.t * (Constr.t list) *)
 
+(* let rec ty_to_str (t: Constr.t) : string = 
+  match Constr.kind t with
+  | Constr.Ind ((n, _), _) -> Names.MutInd.to_string n
+  | Constr.Var id -> Names.Id.to_string id
+  | Constr.Const (n, _) -> Names.Constant.to_string n
+  | Constr.App (f, args) -> ty_to_str f ^ "_" ^ (String.concat "_" (List.map ty_to_str (Array.to_list args))) 
+  | Constr.Sort s -> begin match s with
+      | Sorts.SProp -> "SProp"
+      | Sorts.Prop -> "Prop"
+      | Sorts.Set -> "Set"
+      | Sorts.Type _ -> "Type"
+      end
+  | Constr.Prod _ -> failwith "grounded types only instantiation of polymorphic type"
+  | _ -> failwith "not expected construct for instantiation of polymorphic type"
+*)
 (* error if one of poly args is not Ind - to simplify things *)
-let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
-  ""
+(* let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
+  poly_name ^ "_" ^ String.concat "_" (List.map ty_to_str poly_args) *)
+
+let _constructor_name (e: Environ.env) (n: Names.inductive) (i: int) : string =
+  let ind_info = snd (Inductive.lookup_mind_specif e n) in
+  let name = (ind_info.Declarations.mind_consnames).(i) in
+  Names.Id.to_string name
+
+(* removes n outer-most lambdas *)
+let rec skip_lambdas (n: int) (c: Constr.t) : Constr.t =
+  if n = 0 then c
+  else match Constr.kind c with 
+       | Constr.Lambda (_, _, t1) -> skip_lambdas (n - 1) t1
+       | _ -> failwith "skip_lambdas: expected a lambda"
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
@@ -451,14 +478,12 @@ let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
 let rec constr_to_z3 (c: Constr.t) 
                      (e: Environ.env) 
                      (rels: string list)
-                     (sigma: Evd.evar_map) : string * (pending_def list) =
+                     (sigma: Evd.evar_map) : string (* * (pending_def list) *)   =
   match Constr.kind c with
   (* TODO inspect App, to check if all cases are handled properly*)
   | Constr.App (f, arr) -> 
       let f_ty = constr_type f e sigma in
-      let f_ret_ty = (* CoqInterface.warning "debug" (constr_to_z3 f e rels sigma) ;
-                     CoqInterface.warning "debug-ty" (constr_to_z3 f_ty e rels sigma) ; *)
-                     CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print f_ty)) ; return_type f_ty in
+      let f_ret_ty = return_type f_ty in
       let args = Array.to_list arr in
       (* if f return Prop (e.g. eq, and, or) *)
       if Constr.is_Prop f_ret_ty then 
@@ -469,13 +494,13 @@ let rec constr_to_z3 (c: Constr.t)
         | _ :: _ -> 
             let args_str = String.concat " " 
               (List.map (fun c' -> constr_to_z3 c' e rels sigma) args_no_types) in
-            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+            args_str ^ "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
         end
       (* if it is an inductive and not of type prop, then it is a "computable" datatype
          so leave the types e.g. list nat - leave the nat *)
       else if Constr.isInd f then
         let args_str = String.concat " " 
-              (List.map (fun c' -> constr_to_z3 c' e rels sigma) args) in
+          (List.map (fun c' -> constr_to_z3 c' e rels sigma) args) in
             "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
       (* if f returns a type which is a Set, e.g. nat, list nat*)
       else
@@ -544,10 +569,30 @@ let rec constr_to_z3 (c: Constr.t)
       | _ -> failwith ("definition for name " ^ name_str ^ " is not available")
       end
   | Constr.Construct (((mutind, _), index), univ) -> 
+      (* TODO get name of constructor *)
       Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
-  | Constr.Case (ci, constr, inv, constr2, arr) -> 
-    let branch_str = Array.fold_right (fun c r -> constr_to_z3 c e rels sigma ^ " ;; " ^ r) arr "" in
-      "(match " ^ constr_to_z3 constr2 e rels sigma ^  "with" ^ branch_str ^ ")"
+  | Constr.Case (ci, constr, inv, scr, arr) -> 
+    let ind_info = snd (Inductive.lookup_mind_specif e (ci.Constr.ci_ind)) in
+    let ind_name = Names.MutInd.to_string (fst ci.Constr.ci_ind) in
+    let scr_str = constr_to_z3 scr e rels sigma in 
+    let branch_to_z3 (index: int) (body: Constr.t) : string =
+      begin
+        let args_count = (ind_info.Declarations.mind_consnrealargs).(index) in
+        let skipped_lambdas = skip_lambdas args_count body in
+        let sels_indices = List.init args_count (fun x -> x + 1) in
+        let c_name = ind_name ^ "_c" ^ string_of_int index in
+        let sels_names = List.map (fun i -> ("(" ^ c_name ^ "_s" ^ string_of_int i ^ " " ^ scr_str ^ ")")) sels_indices in
+        (*let sels_vars = List.map (fun n -> Constr.mkVar (Names.Id.of_string n)) sels_names in *)
+        (* the body of a pattern is a lambda: e.g. cons h t -> e ==> \h -> \t -> e*)
+        (* let body_no_lams = Reduction.beta_applist body sels_vars in *)
+        (* CoqInterface.warning "debug-br" (Pp.db_string_of_pp (Constr.debug_print body)) ; *)
+        let rels' = List.append (List.rev sels_names) rels in
+        "(" ^ c_name ^ " " ^ constr_to_z3 skipped_lambdas e rels' sigma ^ ")"
+      end
+    in
+    let brs_indices = List.init (Array.length arr) (fun x -> x) in
+    let brs_strs = List.map (fun (a, b) -> branch_to_z3 a b) (List.combine brs_indices (Array.to_list arr)) in 
+    "(match " ^ scr_str ^ " (" ^ String.concat "\n" brs_strs ^ "))"
   | Constr.Rel i -> List.nth rels (i - 1)
   | Constr.Fix _ -> "(fix)"
   | Constr.Sort _ -> "(sort)"

@@ -27,6 +27,7 @@
 -I smtlib2
 -I trace
 -I verit
+-I z3
 -I zchaff
 -I PArray
 -I ../3rdparty/alt-ergo
@@ -92,6 +93,14 @@ verit/verit.ml
 verit/verit.mli
 verit/veritSyntax.ml
 verit/veritSyntax.mli
+
+z3/z3Parser.ml
+z3/z3Parser.mli
+z3/z3Lexer.ml
+z3/z3.ml
+z3/z3.mli
+z3/z3Syntax.ml
+z3/z3Syntax.mli
 
 lfsc/shashcons.ml
 lfsc/shashcons.mli
