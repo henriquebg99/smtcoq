@@ -18,18 +18,6 @@ Require Import SMTCoq.SMTCoq.
 Require Import Bool.
 Require Import Coq.Lists.List.
 
-
-Require Import ZArith.
-
-Import BVList.BITVECTOR_LIST.
-Local Open Scope bv_scope.
-
-Import FArray.
-Local Open Scope farray_scope.
-
-Goal match cons 1 nil with cons h t => length t | nil => 0 end = 1.
-Proof. print_type.
-
 Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
 Proof. intros. print_type.
 Abort.

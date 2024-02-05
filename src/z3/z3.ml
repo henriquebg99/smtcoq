@@ -464,12 +464,15 @@ let _constructor_name (e: Environ.env) (n: Names.inductive) (i: int) : string =
   let name = (ind_info.Declarations.mind_consnames).(i) in
   Names.Id.to_string name
 
-(* removes n outer-most lambdas *)
-let rec skip_lambdas (n: int) (c: Constr.t) : Constr.t =
-  if n = 0 then c
-  else match Constr.kind c with 
-       | Constr.Lambda (_, _, t1) -> skip_lambdas (n - 1) t1
-       | _ -> failwith "skip_lambdas: expected a lambda"
+(* given a constr with with n nested lambdas as outer-most construction, return its arguments types *)
+let rec extract_lambdas_types (n: int) (c: Constr.t) : Constr.types list =
+if n = 0 then []
+else match Constr.kind c with 
+      | Constr.Lambda (_, tn, t1) -> tn :: extract_lambdas_types (n - 1) t1
+      | _ -> failwith "extract_lambdas_types: expected a lambda"
+
+(* we generate fresh vars for match *)
+let next_match_id : int ref = ref 0
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
@@ -481,7 +484,7 @@ let rec constr_to_z3 (c: Constr.t)
                      (sigma: Evd.evar_map) : string (* * (pending_def list) *)   =
   match Constr.kind c with
   (* TODO inspect App, to check if all cases are handled properly*)
-  | Constr.App (f, arr) -> 
+  | Constr.App (f, arr) ->
       let f_ty = constr_type f e sigma in
       let f_ret_ty = return_type f_ty in
       let args = Array.to_list arr in
@@ -494,7 +497,7 @@ let rec constr_to_z3 (c: Constr.t)
         | _ :: _ -> 
             let args_str = String.concat " " 
               (List.map (fun c' -> constr_to_z3 c' e rels sigma) args_no_types) in
-            args_str ^ "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
         end
       (* if it is an inductive and not of type prop, then it is a "computable" datatype
          so leave the types e.g. list nat - leave the nat *)
@@ -557,7 +560,7 @@ let rec constr_to_z3 (c: Constr.t)
           let t1' = constr_to_z3 t1 e (name :: rels) sigma in 
           "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
       end
-  | Constr.Var id -> Names.Id.to_string id
+  | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
       let name_str = Names.MutInd.to_string mutind in 
       Option.default name_str (M.find_opt name_str special_inductives)
@@ -569,25 +572,43 @@ let rec constr_to_z3 (c: Constr.t)
       | _ -> failwith ("definition for name " ^ name_str ^ " is not available")
       end
   | Constr.Construct (((mutind, _), index), univ) -> 
-      (* TODO get name of constructor *)
+      (* TODO get name of constructor -> get the type, extract ind there *)
       Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
+      (* let ty = constr_type c e sigma in
+      let ind_name = fst (fst (Inductive.find_inductive e ty)) in
+      constructor_name e ind_name index *)
+
   | Constr.Case (ci, constr, inv, scr, arr) -> 
     let ind_info = snd (Inductive.lookup_mind_specif e (ci.Constr.ci_ind)) in
     let ind_name = Names.MutInd.to_string (fst ci.Constr.ci_ind) in
     let scr_str = constr_to_z3 scr e rels sigma in 
     let branch_to_z3 (index: int) (body: Constr.t) : string =
       begin
+        (* generate fresh id prefix*)
+        let match_id = (next_match_id := !next_match_id + 1) ; !next_match_id in
+        (* constructor arg count *)
         let args_count = (ind_info.Declarations.mind_consnrealargs).(index) in
-        let skipped_lambdas = skip_lambdas args_count body in
+        (* [1, 2, ..., arg count] *)
         let sels_indices = List.init args_count (fun x -> x + 1) in
-        let c_name = ind_name ^ "_c" ^ string_of_int index in
+        let c_name = ind_name ^ "_c" ^ string_of_int (index + 1) in
         let sels_names = List.map (fun i -> ("(" ^ c_name ^ "_s" ^ string_of_int i ^ " " ^ scr_str ^ ")")) sels_indices in
-        (*let sels_vars = List.map (fun n -> Constr.mkVar (Names.Id.of_string n)) sels_names in *)
-        (* the body of a pattern is a lambda: e.g. cons h t -> e ==> \h -> \t -> e*)
-        (* let body_no_lams = Reduction.beta_applist body sels_vars in *)
-        (* CoqInterface.warning "debug-br" (Pp.db_string_of_pp (Constr.debug_print body)) ; *)
-        let rels' = List.append (List.rev sels_names) rels in
-        "(" ^ c_name ^ " " ^ constr_to_z3 skipped_lambdas e rels' sigma ^ ")"
+        (* generate variables for a let binding fresh variables to selector expressions *)
+        let let_vars_names = List.map (fun c -> "mat" ^ string_of_int match_id ^ "_s" ^ string_of_int c) sels_indices in
+        let let_bindings = List.map (fun (vn, sn) -> "(" ^ vn ^ " " ^ sn ^ ")") (List.combine let_vars_names sels_names) in
+        let let_vars = List.map (fun n -> Constr.mkVar (Names.Id.of_string n)) let_vars_names in
+        let body_no_lams = Reduction.beta_applist body let_vars in
+        let types = extract_lambdas_types args_count body in
+        let e' = List.fold_right 
+                  (fun (v, t) r -> 
+                    let ba = { Context.binder_name = Names.Id.of_string v
+                             ; Context.binder_relevance = Sorts.Relevant} in
+                    let la = Context.Named.Declaration.LocalAssum (ba, t) in
+                    Environ.push_named la r)
+                  (List.combine let_vars_names types)
+                  e in
+        let body_no_lams_str = constr_to_z3 body_no_lams e' rels sigma in
+        let branch_let = "(let (" ^ String.concat "\n" let_bindings ^ ")" ^ body_no_lams_str ^ ")" in
+        "(" ^ c_name ^ " " ^  branch_let  ^ ")"
       end
     in
     let brs_indices = List.init (Array.length arr) (fun x -> x) in
