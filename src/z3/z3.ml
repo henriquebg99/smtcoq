@@ -436,11 +436,7 @@ let split_inital_types (args: Constr.t list)
   | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
   | None -> (r1, r2)
 
-(* name of constant and list of types for monomorphization
-   e.g. (app, [A]) -> get a version of app for A, called app_A *)
-(* type pending_def = Names.Constant.t * (Constr.t list) *)
-
-(* let rec ty_to_str (t: Constr.t) : string = 
+let rec ty_to_str (t: Constr.t) : string = 
   match Constr.kind t with
   | Constr.Ind ((n, _), _) -> Names.MutInd.to_string n
   | Constr.Var id -> Names.Id.to_string id
@@ -454,7 +450,10 @@ let split_inital_types (args: Constr.t list)
       end
   | Constr.Prod _ -> failwith "grounded types only instantiation of polymorphic type"
   | _ -> failwith "not expected construct for instantiation of polymorphic type"
-*)
+
+let monomorphic_name (name: string) (tys: Constr.types list) : string =
+  name ^ "_" ^ (String.concat "_" (List.map ty_to_str tys))
+
 (* error if one of poly args is not Ind - to simplify things *)
 (* let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
   poly_name ^ "_" ^ String.concat "_" (List.map ty_to_str poly_args) *)
@@ -474,6 +473,48 @@ else match Constr.kind c with
 (* we generate fresh vars for match *)
 let next_match_id : int ref = ref 0
 
+(* name of constant and list of types for monomorphization
+   e.g. (app, [A]) -> get a version of app for A, called app_A *)
+type pending_def = Names.Constant.t * (Constr.t list) 
+let rec pending_defs (e: Environ.env) 
+                     (sigma: Evd.evar_map)
+                     (c: Constr.t)  : pending_def list =
+  match Constr.kind c with
+  | Constr.App (f, arr) -> 
+    let f_ty = constr_type f e sigma in
+      let f_ret_ty = return_type f_ty in
+      let args = Array.to_list arr in
+      let f_pending = begin
+        if Constr.is_Prop f_ret_ty then
+          (* we only support some built-in props - eq, and, or...*)
+          begin match Constr.kind f with
+          | Constr.Ind ((mutind, _), univ) -> 
+            let name_str = Names.MutInd.to_string mutind in 
+            begin match (M.find_opt name_str special_inductives) with
+            | None -> failwith "User-defined props not yet supported"
+            | Some _ -> []
+            end
+          | _ -> failwith "Expected inductive in the place of a Prop"
+          end
+        else if Constr.isInd f then []
+        (* if f returns a type which is a Set, e.g. nat, list nat*)
+        else 
+          let (tys, _) = split_inital_types args e sigma in 
+          match Constr.kind f with
+          | Constr.Const (name, _) -> [(name, tys)]
+          | Constr.Lambda _ -> []
+          | _ -> failwith "expected application of lambda or constant"
+      end in f_pending @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
+  | Constr.Prod (_, t1, t2) ->
+    (pending_defs e sigma t1) @ (pending_defs e sigma t2)
+  | Constr.LetIn (_, t1, tn, t2) ->
+    (pending_defs e sigma t1) @ (pending_defs e sigma t2) @ (pending_defs e sigma tn)
+  | Constr.Lambda (_, tn, t1) ->
+    (pending_defs e sigma t1) @ (pending_defs e sigma tn)
+    | Constr.Case (_, _, _, scr, arr) -> 
+      pending_defs e sigma scr @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
+  | _ -> []
+
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
    * a name in position i - 1 should replace (Constr.Rel i)
@@ -490,6 +531,7 @@ let rec constr_to_z3 (c: Constr.t)
       let args = Array.to_list arr in
       (* if f return Prop (e.g. eq, and, or) *)
       if Constr.is_Prop f_ret_ty then 
+        (* TODO support user defined propositions *)
         (* remove types e.g. eq nat n1 n2 -> eq n1 n2 *)
         let args_no_types = remove_initial_types_non_props args e sigma in
         begin match args_no_types with
@@ -507,13 +549,19 @@ let rec constr_to_z3 (c: Constr.t)
             "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
       (* if f returns a type which is a Set, e.g. nat, list nat*)
       else
-        let (_, args') = split_inital_types args e sigma in
+        let (tys, args') = split_inital_types args e sigma in
+        let f_str = begin match Constr.kind f with
+                    | Constr.Const (name, _) -> 
+                      monomorphic_name (Names.Constant.to_string name) tys
+                    | Constr.Lambda _ -> constr_to_z3 f e rels sigma
+                    | _ -> failwith "expected application of lambda or constant"
+                    end in
         begin match args' with
-        | [] -> constr_to_z3 f e rels sigma
+        | [] -> f_str
         | _ :: _ -> 
             let args_str = String.concat " " 
               (List.map (fun c' -> constr_to_z3 c' e rels sigma) args') in
-            "(" ^ constr_to_z3 f e rels sigma ^ " " ^ args_str ^ ")"
+            "(" ^ f_str ^ " " ^ args_str ^ ")"
         end
       
   | Constr.Prod (n, t1, t2) ->  
@@ -675,6 +723,14 @@ let call_z3 (script: string) : Z3Syntax.z3answer =
       | Some r -> r
       | None -> CoqInterface.error ("z3 did not return a solution")
 
+let get_hyp_pending  (sigma: Evd.evar_map)
+                     (e: Environ.env)                     
+                     hyp : pending_def list =
+  match hyp with
+  | Context.Named.Declaration.LocalAssum (hname, hyp_econstr) ->
+      pending_defs e sigma (EConstr.to_constr sigma hyp_econstr)
+  | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
+
 let hyp_to_z3_assert (sigma: Evd.evar_map)
                      (e: Environ.env)                     
                      hyp : string =
@@ -723,7 +779,8 @@ let print_type () =
 
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
-
+    let pending_hyps = List.concat_map (get_hyp_pending sigma env) hyps in
+    CoqInterface.warning "pending" ("There are " ^ string_of_int (List.length pending_hyps) ^ " pending defs") ; 
     let goal_z3 = "(assert " ^ constr_to_z3 t env [] sigma ^ ")" in 
     let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
     let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
