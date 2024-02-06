@@ -540,10 +540,18 @@ let rec c2str (c: Constr.t) : string =
   | Constr.Const (name, univ) -> Names.Constant.to_string name
   | Constr.Construct (((mutind, _), index), _) -> Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
   | Constr.Rel i -> "Rel(" ^ string_of_int i ^ ")"
-  | Constr.Fix _ -> "--fix--"
-  | Constr.App (f, arr) -> "(" ^ c2str f ^  " )"
+  | Constr.App (f, arr) -> "(" ^ c2str f ^ " " ^ String.concat " " (List.map c2str (Array.to_list arr)) ^ ")"
+  | Constr.Case (_, _, _, scr, arr) -> "Match (" ^ c2str scr ^ ", (" ^ String.concat ", " (List.map c2str (Array.to_list arr)) ^ "))"
   | Constr.Meta _ | Constr.Evar _ | Constr.Sort _ -> "spec"
+  | Constr.Fix _ -> "fix"
   | _ -> "other"
+
+
+let declare_var (e: Environ.env) (id: Names.Id.t) (t: Constr.types) : Environ.env =  
+  let ba = { Context.binder_name = id
+          ; Context.binder_relevance = Sorts.Relevant} in
+  let la = Context.Named.Declaration.LocalAssum (ba, t) in
+  Environ.push_named la e
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
@@ -605,11 +613,12 @@ let rec constr_to_z3 (c: Constr.t)
             then failwith "quantification over props is not supported"
             else 
               let name = Names.Id.to_string id in 
+              let e' = declare_var e id t1 in
               let t1' = constr_to_z3 t1 e rels sigma in
-              let t2' = constr_to_z3 t2 e (name :: rels) sigma in
+              let t2' = constr_to_z3 t2 e' rels sigma in
               "(forall ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")"
       end
-  | Constr.LetIn (n, t1, _, t2) ->
+  | Constr.LetIn (n, t1, tn, t2) ->
       begin match (Context.binder_name n) with  
       (* the variable of forall is _, so treat as implication *)
       | Names.Name.Anonymous -> failwith "let with anonymous binding"
@@ -620,23 +629,19 @@ let rec constr_to_z3 (c: Constr.t)
             then failwith "let with prop is not supported"
             else 
               let name = Names.Id.to_string id in
+              let e' = declare_var e id tn in
               let t1' = constr_to_z3 t1 e rels sigma in
-              let t2' = constr_to_z3 t2 e (name :: rels) sigma in
+              let t2' = constr_to_z3 t2 e' rels sigma in
               "(let ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")" 
       end
   | Constr.Lambda (n, tn, t1) ->
-      begin match (Context.binder_name n) with
-      | Names.Name.Anonymous -> 
-          let name = "_" in
-          let tn' = constr_to_z3 tn e rels sigma in
-          let t1' = constr_to_z3 t1 e (name :: rels) sigma in 
-          "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
-      | Names.Name.Name id ->
-          let name = Names.Id.to_string id in
-          let tn' = constr_to_z3 tn e rels sigma in
-          let t1' = constr_to_z3 t1 e (name :: rels) sigma in 
-          "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
-      end
+      let name, e' = match (Context.binder_name n) with
+                  | Names.Name.Anonymous ->  "_", e
+                  | Names.Name.Name id -> 
+                    Names.Id.to_string id, declare_var e id tn in
+      let tn' = constr_to_z3 tn e rels sigma in
+      let t1' = constr_to_z3 t1 e' rels sigma in 
+      "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
   | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
       let name_str = Names.MutInd.to_string mutind in 
@@ -684,7 +689,7 @@ let rec constr_to_z3 (c: Constr.t)
                   (List.combine let_vars_names types)
                   e in
         let body_no_lams_str = constr_to_z3 body_no_lams e' rels sigma in
-        let branch_let = "(let (" ^ String.concat "\n" let_bindings ^ ")" ^ body_no_lams_str ^ ")" in
+        let branch_let = "(let (" ^ String.concat "\n" let_bindings ^ ") " ^ body_no_lams_str ^ ")" in
         "(" ^ c_name ^ " " ^  branch_let  ^ ")"
       end
     in
@@ -704,6 +709,14 @@ let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) li
     let (l, b) = extract_lambdas_params t in ((n', tn) :: l, b)
   | _ -> ([], c)
 
+let name_id_err (n: Names.Name.t) : Names.Id.t = 
+  match n with
+  | Names.Name.Name id -> id
+  | Names.Name.Anonymous -> failwith "wildcard in fixpoint params not supported"
+  
+let z3_name (s: string) : string =
+  String.concat "_" (String.split_on_char '.' s)
+
 (* returns a def-fun-rec for a pending definition *)
 let define_pending (e: Environ.env)
                    (sigma: Evd.evar_map)
@@ -711,41 +724,48 @@ let define_pending (e: Environ.env)
   let (name, tys) = p in
   match (Environ.lookup_constant name e).Declarations.const_body with
   | Declarations.Def d -> 
+    (* typically, a fixpoint definition is fun (A: Type) fun (p1: ty1) ... fix recname fun(p_k+1: ty)... def*)
     (* instantiate polymorphic parameters *)
     let d = Mod_subst.force_constr d in
     let mono_def = if List.length tys = 0 then d
                    else Reduction.beta_applist d tys in
-    let fun_name = Names.Constant.to_string name in 
-    let _mono_name = monomorphic_name fun_name tys in
+    let fun_name = z3_name (Names.Constant.to_string name) in 
+    let mono_name = monomorphic_name fun_name tys in
+    CoqInterface.warning "Z3_NAME" mono_name ;
+    (* now, we have fun (p1: ty1) ... fix recname fun(p_k+1: ty)... def *)
+    (* extract params up to fix *)
     let (vars_types, body) = extract_lambdas_params mono_def in
-    begin match Constr.kind body with
+    let vars = List.map (fun vt -> Constr.mkVar (name_id_err (fst vt))) vars_types in
+    let e = List.fold_right 
+              (fun (name, ty) r -> declare_var r (name_id_err name) ty)
+              vars_types 
+              e in
+    let body_applied = Reduction.beta_applist mono_def vars in
+    (* now, we have fix recname fun(p_k+1: ty)... def *)
+    begin match Constr.kind body_applied with
     (* recursive function *)
     | Constr.Fix (_, (names, types, bodies)) -> 
-      let vars = List.map 
-        (fun name -> 
-          match fst name with
-          | Names.Name.Name id -> Constr.mkVar id
-          | Names.Name.Anonymous -> failwith "wildcard in fixpoint params not supported") vars_types in
-      let e' = List.fold_right 
-                (fun (name, t) r -> 
-                  match name with
-                  | Names.Name.Name id -> 
-                    let ba = { Context.binder_name = id
-                            ; Context.binder_relevance = Sorts.Relevant} in
-                    let la = Context.Named.Declaration.LocalAssum (ba, t) in
-                    Environ.push_named la r
-                  | Names.Name.Anonymous -> failwith "wildcard in fixpoint params not supported")
-                vars_types
+      (* replace rel of the recursive def *)
+      let body_fixvar_subst = 
+        Reduction.beta_app 
+          (Constr.mkLambda (names.(0), types.(0), bodies.(0)))
+          (Constr.mkVar (Names.Id.of_string mono_name)) in
+      let (vars_types, body) = extract_lambdas_params body_fixvar_subst in
+      let vars = List.map (fun vt -> Constr.mkVar (name_id_err (fst vt))) vars_types  in
+      let e = List.fold_right 
+                (fun (name, ty) r -> declare_var r (name_id_err name) ty)
+                (vars_types @ [((Names.Name.Name (Names.Id.of_string mono_name), types.(0)))])
                 e in
-      let _ = e' in
-      let body_applied = Reduction.beta_applist bodies.(0) vars in
-      CoqInterface.warning "debug" (match  (Context.binder_name names.(0)) with
-      | Names.Name.Name id -> Names.Id.to_string id
-      | Names.Name.Anonymous ->  "_"); 
-      CoqInterface.warning "debug" (c2str body_applied) ;
-      (*CoqInterface.warning "debug" (constr_to_z3 body_applied e [] sigma); 
-      CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print body_applied));*) ""
-    | _ -> ""
+      let _ = c2str types.(0) in
+      let body_applied = Reduction.beta_applist body_fixvar_subst vars in
+      (*CoqInterface.warning "body" (c2str bodies.(0)) ; *)
+      CoqInterface.warning "body-applied'" (c2str body_applied) ;
+      (* CoqInterface.warning "vars" ("There are " ^ string_of_int (List.length vars) ^ " variables") ;*)
+      (*CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print body_applied));*)
+      let binds_str = "" in
+      "(define-fun-rec " ^ mono_name ^ " (" ^ binds_str ^ ") " ^ constr_to_z3 (return_type types.(0)) e [] sigma ^ " " ^ 
+      constr_to_z3 body_applied e [] sigma ^ ")"
+    | _ -> failwith "error"
     end
   | _ -> ""
 
@@ -862,11 +882,11 @@ let print_type () =
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
     let pending_hyps = List.concat_map (get_hyp_pending sigma env) hyps in
-    let _ = define_pending env sigma (List.hd pending_hyps) in
+    let pend = define_pending env sigma (List.hd pending_hyps) in
     CoqInterface.warning "pending" ("There are " ^ string_of_int (List.length pending_hyps) ^ " pending defs") ;
     let goal_z3 = "(assert " ^ constr_to_z3 t env [] sigma ^ ")" in 
     let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
-    let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
+    let script = types_and_funcs () ^"\n" ^ pend ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
 
     match call_z3 script with
     | Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat" ;  CoqInterface.tclIDTAC
