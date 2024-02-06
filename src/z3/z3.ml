@@ -502,8 +502,7 @@ let rec pending_defs (e: Environ.env)
           let (tys, _) = split_inital_types args e sigma in 
           match Constr.kind f with
           | Constr.Const (name, _) -> [(name, tys)]
-          | Constr.Lambda _ -> []
-          | _ -> failwith "expected application of lambda or constant"
+          | _ -> pending_defs e sigma f
       end in f_pending @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
   | Constr.Prod (_, t1, t2) ->
     (pending_defs e sigma t1) @ (pending_defs e sigma t2)
@@ -514,6 +513,37 @@ let rec pending_defs (e: Environ.env)
     | Constr.Case (_, _, _, scr, arr) -> 
       pending_defs e sigma scr @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
   | _ -> []
+
+let rec c2str (c: Constr.t) : string =
+  match Constr.kind c with
+  | Constr.Lambda (n, tn, t) -> 
+    let n_str = 
+      begin match (Context.binder_name n) with
+      | Names.Name.Anonymous -> "_"
+      | Names.Name.Name id -> Names.Id.to_string id
+      end in "Lambda(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")"
+  | Constr.Prod (n, tn, t) -> 
+    let n_str = 
+      begin match (Context.binder_name n) with
+      | Names.Name.Anonymous -> "_"
+      | Names.Name.Name id -> Names.Id.to_string id
+      end in "Prod(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")" 
+  | Constr.LetIn (n, v, tn, t) -> 
+    let n_str = 
+      begin match (Context.binder_name n) with
+      | Names.Name.Anonymous -> "_"
+      | Names.Name.Name id -> Names.Id.to_string id
+      end in "LetIn(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str v ^ ", " ^ c2str t ^ ")"
+
+  | Constr.Var id -> Names.Id.to_string id
+  | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind 
+  | Constr.Const (name, univ) -> Names.Constant.to_string name
+  | Constr.Construct (((mutind, _), index), _) -> Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
+  | Constr.Rel i -> "Rel(" ^ string_of_int i ^ ")"
+  | Constr.Fix _ -> "--fix--"
+  | Constr.App (f, arr) -> "(" ^ c2str f ^  " )"
+  | Constr.Meta _ | Constr.Evar _ | Constr.Sort _ -> "spec"
+  | _ -> "other"
 
 (* converts a constr to Z3 expression 
    * rels is the list of names of variables to replace de Brujin indices 
@@ -553,8 +583,7 @@ let rec constr_to_z3 (c: Constr.t)
         let f_str = begin match Constr.kind f with
                     | Constr.Const (name, _) -> 
                       monomorphic_name (Names.Constant.to_string name) tys
-                    | Constr.Lambda _ -> constr_to_z3 f e rels sigma
-                    | _ -> failwith "expected application of lambda or constant"
+                    | _ -> constr_to_z3 f e rels sigma
                     end in
         begin match args' with
         | [] -> f_str
@@ -663,9 +692,62 @@ let rec constr_to_z3 (c: Constr.t)
     let brs_strs = List.map (fun (a, b) -> branch_to_z3 a b) (List.combine brs_indices (Array.to_list arr)) in 
     "(match " ^ scr_str ^ " (" ^ String.concat "\n" brs_strs ^ "))"
   | Constr.Rel i -> List.nth rels (i - 1)
-  | Constr.Fix _ -> "(fix)"
+  | Constr.Fix _ -> failwith ("evaluation of apps of fixpoints not supported yet")
   | Constr.Sort _ -> "(sort)"
-  | _ -> "(ERROR)"
+  | _ -> failwith "Conversion not supported"
+
+(* given \x1:t1 -> ... \xn:tn -> b returns ([(x1, t1), ..., (xn, tn)], b) *)
+let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) list) * Constr.t =
+  match Constr.kind c with (* TODO rule out dependent types, which cannot be enconded in Z3*)
+  | Constr.Lambda (n, tn, t) -> 
+    let n' = Context.binder_name n in
+    let (l, b) = extract_lambdas_params t in ((n', tn) :: l, b)
+  | _ -> ([], c)
+
+(* returns a def-fun-rec for a pending definition *)
+let define_pending (e: Environ.env)
+                   (sigma: Evd.evar_map)
+                   (p: pending_def) : string =
+  let (name, tys) = p in
+  match (Environ.lookup_constant name e).Declarations.const_body with
+  | Declarations.Def d -> 
+    (* instantiate polymorphic parameters *)
+    let d = Mod_subst.force_constr d in
+    let mono_def = if List.length tys = 0 then d
+                   else Reduction.beta_applist d tys in
+    let fun_name = Names.Constant.to_string name in 
+    let _mono_name = monomorphic_name fun_name tys in
+    let (vars_types, body) = extract_lambdas_params mono_def in
+    begin match Constr.kind body with
+    (* recursive function *)
+    | Constr.Fix (_, (names, types, bodies)) -> 
+      let vars = List.map 
+        (fun name -> 
+          match fst name with
+          | Names.Name.Name id -> Constr.mkVar id
+          | Names.Name.Anonymous -> failwith "wildcard in fixpoint params not supported") vars_types in
+      let e' = List.fold_right 
+                (fun (name, t) r -> 
+                  match name with
+                  | Names.Name.Name id -> 
+                    let ba = { Context.binder_name = id
+                            ; Context.binder_relevance = Sorts.Relevant} in
+                    let la = Context.Named.Declaration.LocalAssum (ba, t) in
+                    Environ.push_named la r
+                  | Names.Name.Anonymous -> failwith "wildcard in fixpoint params not supported")
+                vars_types
+                e in
+      let _ = e' in
+      let body_applied = Reduction.beta_applist bodies.(0) vars in
+      CoqInterface.warning "debug" (match  (Context.binder_name names.(0)) with
+      | Names.Name.Name id -> Names.Id.to_string id
+      | Names.Name.Anonymous ->  "_"); 
+      CoqInterface.warning "debug" (c2str body_applied) ;
+      (*CoqInterface.warning "debug" (constr_to_z3 body_applied e [] sigma); 
+      CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print body_applied));*) ""
+    | _ -> ""
+    end
+  | _ -> ""
 
 let call_z3 (script: string) : Z3Syntax.z3answer =
     let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
@@ -723,7 +805,7 @@ let call_z3 (script: string) : Z3Syntax.z3answer =
       | Some r -> r
       | None -> CoqInterface.error ("z3 did not return a solution")
 
-let get_hyp_pending  (sigma: Evd.evar_map)
+let get_hyp_pending (sigma: Evd.evar_map)
                      (e: Environ.env)                     
                      hyp : pending_def list =
   match hyp with
@@ -780,7 +862,8 @@ let print_type () =
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
     let pending_hyps = List.concat_map (get_hyp_pending sigma env) hyps in
-    CoqInterface.warning "pending" ("There are " ^ string_of_int (List.length pending_hyps) ^ " pending defs") ; 
+    let _ = define_pending env sigma (List.hd pending_hyps) in
+    CoqInterface.warning "pending" ("There are " ^ string_of_int (List.length pending_hyps) ^ " pending defs") ;
     let goal_z3 = "(assert " ^ constr_to_z3 t env [] sigma ^ ")" in 
     let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
     let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ goal_z3 in
