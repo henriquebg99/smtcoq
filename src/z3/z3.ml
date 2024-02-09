@@ -388,9 +388,9 @@ let special_funcs = M.of_seq (List.to_seq [
 (* returns the type of a construction *)
 let constr_type (c: Constr.t) 
                 (e: Environ.env) 
-                (sigma: Evd.evar_map) : Constr.types =
-  EConstr.to_constr sigma (
-    snd (Typing.type_of e sigma (EConstr.of_constr c)))
+                (s: Evd.evar_map) : Constr.types =
+  EConstr.to_constr s (
+    snd (Typing.type_of e s (EConstr.of_constr c)))
 
 (* extract return type of a type, expects Sort, Ind, Arrow. App (e.g. list nat), not dependent type *)
 let rec return_type (t: Constr.types) : Constr.types =
@@ -416,9 +416,9 @@ let rec split_while (f: 'a -> bool) (l: 'a list) : ('a list) * ('a list) =
    if the remainig args have types (no prop) raises error*)
 let remove_initial_types_non_props (args: Constr.t list)
                       (e: Environ.env) 
-                      (sigma: Evd.evar_map) : 
+                      (s: Evd.evar_map) : 
                       (Constr.t list) = 
-  let pred a = begin let ty = constr_type a e sigma in 
+  let pred a = begin let ty = constr_type a e s in 
     Constr.isSort ty && (not (Constr.is_Prop ty)) end in
   let (_, r2) = split_while pred args in
   match List.find_opt pred r2 with
@@ -428,9 +428,9 @@ let remove_initial_types_non_props (args: Constr.t list)
 (* similiar to remove_initial but also removes Props and returns the also the removed*)
 let split_inital_types (args: Constr.t list)
                      (e: Environ.env) 
-                     (sigma: Evd.evar_map) : 
+                     (s: Evd.evar_map) : 
                      (Constr.t list) * (Constr.t list) = 
-  let pred a = Constr.isSort (constr_type a e sigma) in 
+  let pred a = Constr.isSort (constr_type a e s) in 
   let (r1, r2) = split_while pred args in
   match List.find_opt pred r2 with
   | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
@@ -477,12 +477,12 @@ else match Constr.kind c with
 (* name of constant and list of types for monomorphization
    e.g. (app, [A]) -> get a version of app for A, called app_A *)
 type pending_def = Names.Constant.t * (Constr.t list) 
-let rec pending_defs (e: Environ.env) 
-                     (sigma: Evd.evar_map)
+let rec pending_defs (s: Evd.evar_map)
+                     (e: Environ.env) 
                      (c: Constr.t)  : pending_def list =
   match Constr.kind c with
   | Constr.App (f, arr) -> 
-    let f_ty = constr_type f e sigma in
+    let f_ty = constr_type f e s in
       let f_ret_ty = return_type f_ty in
       let args = Array.to_list arr in
       let f_pending = begin
@@ -500,19 +500,19 @@ let rec pending_defs (e: Environ.env)
         else if Constr.isInd f then []
         (* if f returns a type which is a Set, e.g. nat, list nat*)
         else 
-          let (tys, _) = split_inital_types args e sigma in 
+          let (tys, _) = split_inital_types args e s in 
           match Constr.kind f with
           | Constr.Const (name, _) -> [(name, tys)]
-          | _ -> pending_defs e sigma f
-      end in f_pending @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
+          | _ -> pending_defs s e f
+      end in f_pending @ List.concat_map (pending_defs s e) (Array.to_list arr)
   | Constr.Prod (_, t1, t2) ->
-    (pending_defs e sigma t1) @ (pending_defs e sigma t2)
+    (pending_defs s e t1) @ (pending_defs s e t2)
   | Constr.LetIn (_, t1, tn, t2) ->
-    (pending_defs e sigma t1) @ (pending_defs e sigma t2) @ (pending_defs e sigma tn)
+    (pending_defs s e t1) @ (pending_defs s e t2) @ (pending_defs s e tn)
   | Constr.Lambda (_, tn, t1) ->
-    (pending_defs e sigma t1) @ (pending_defs e sigma tn)
+    (pending_defs s e t1) @ (pending_defs s e tn)
     | Constr.Case (_, _, _, scr, arr) -> 
-      pending_defs e sigma scr @ List.concat_map (pending_defs e sigma) (Array.to_list arr)
+      pending_defs s e scr @ List.concat_map (pending_defs s e) (Array.to_list arr)
   | _ -> []
 (* FIXME to delete *)
 let rec c2str (c: Constr.t) : string =
@@ -576,44 +576,44 @@ type z3script = { sorts : string list
 (* converts a constr to Z3 expression *)
 let rec constr_to_z3 (c: Constr.t) 
                      (e: Environ.env) 
-                     (sigma: Evd.evar_map) : string (* * (pending_def list) *)   =
+                     (s: Evd.evar_map) : string (* * (pending_def list) *)   =
   match Constr.kind c with
   (* TODO inspect App, to check if all cases are handled properly*)
   | Constr.App (f, arr) ->
-      let f_ty = constr_type f e sigma in
+      let f_ty = constr_type f e s in
       let f_ret_ty = return_type f_ty in
       let args = Array.to_list arr in
       (* if f return Prop (e.g. eq, and, or) *)
       if Constr.is_Prop f_ret_ty then 
         (* TODO support user defined propositions *)
         (* remove types e.g. eq nat n1 n2 -> eq n1 n2 *)
-        let args_no_types = remove_initial_types_non_props args e sigma in
+        let args_no_types = remove_initial_types_non_props args e s in
         begin match args_no_types with
-        | [] -> constr_to_z3 f e sigma
+        | [] -> constr_to_z3 f e s
         | _ :: _ -> 
             let args_str = String.concat " " 
-              (List.map (fun c' -> constr_to_z3 c' e  sigma) args_no_types) in
-            "(" ^ constr_to_z3 f e  sigma ^ " " ^ args_str ^ ")"
+              (List.map (fun c' -> constr_to_z3 c' e  s) args_no_types) in
+            "(" ^ constr_to_z3 f e  s ^ " " ^ args_str ^ ")"
         end
       (* if it is an inductive and not of type prop, then it is a "computable" datatype
          so leave the types e.g. list nat - leave the nat *)
       else if Constr.isInd f then
         let args_str = String.concat " " 
-          (List.map (fun c' -> constr_to_z3 c' e  sigma) args) in
-            "(" ^ constr_to_z3 f e  sigma ^ " " ^ args_str ^ ")"
+          (List.map (fun c' -> constr_to_z3 c' e  s) args) in
+            "(" ^ constr_to_z3 f e  s ^ " " ^ args_str ^ ")"
       (* if f returns a type which is a Set, e.g. nat, list nat*)
       else
-        let (tys, args') = split_inital_types args e sigma in
+        let (tys, args') = split_inital_types args e s in
         let f_str = begin match Constr.kind f with
                     | Constr.Const (name, _) -> 
                       z3_name (monomorphic_name (Names.Constant.to_string name) tys)
-                    | _ -> constr_to_z3 f e  sigma
+                    | _ -> constr_to_z3 f e  s
                     end in
         begin match args' with
         | [] -> f_str
         | _ :: _ -> 
             let args_str = String.concat " " 
-              (List.map (fun c' -> constr_to_z3 c' e  sigma) args') in
+              (List.map (fun c' -> constr_to_z3 c' e  s) args') in
             "(" ^ f_str ^ " " ^ args_str ^ ")"
         end
       
@@ -621,7 +621,7 @@ let rec constr_to_z3 (c: Constr.t)
       begin match (Context.binder_name n) with
       (* the variable of forall is _, so treat as implication *)
       | Names.Name.Anonymous -> 
-          "(implies " ^ constr_to_z3 t1 e  sigma ^ " " ^ constr_to_z3 t2 e  sigma ^ ")"
+          "(implies " ^ constr_to_z3 t1 e  s ^ " " ^ constr_to_z3 t2 e  s ^ ")"
       (* the variable has a name *)
       | Names.Name.Name id ->
           (* z3 does not support quantification over props *)
@@ -630,8 +630,8 @@ let rec constr_to_z3 (c: Constr.t)
             else 
               let name = Names.Id.to_string id in 
               let e' = declare_var e id t1 in
-              let t1' = constr_to_z3 t1 e  sigma in
-              let t2' = constr_to_z3 t2 e'  sigma in
+              let t1' = constr_to_z3 t1 e  s in
+              let t2' = constr_to_z3 t2 e'  s in
               "(forall ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")"
       end
   | Constr.LetIn (n, t1, tn, t2) ->
@@ -646,8 +646,8 @@ let rec constr_to_z3 (c: Constr.t)
             else 
               let name = Names.Id.to_string id in
               let e' = declare_var e id tn in
-              let t1' = constr_to_z3 t1 e  sigma in
-              let t2' = constr_to_z3 t2 e'  sigma in
+              let t1' = constr_to_z3 t1 e  s in
+              let t2' = constr_to_z3 t2 e'  s in
               "(let ((" ^ name ^ " " ^ t1' ^ ")) " ^ t2' ^ ")" 
       end
   | Constr.Lambda (n, tn, t1) ->
@@ -655,8 +655,8 @@ let rec constr_to_z3 (c: Constr.t)
                   | Names.Name.Anonymous ->  "_", e
                   | Names.Name.Name id -> 
                     Names.Id.to_string id, declare_var e id tn in
-      let tn' = constr_to_z3 tn e  sigma in
-      let t1' = constr_to_z3 t1 e'  sigma in 
+      let tn' = constr_to_z3 tn e  s in
+      let t1' = constr_to_z3 t1 e'  s in 
       "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
   | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
@@ -672,14 +672,14 @@ let rec constr_to_z3 (c: Constr.t)
   | Constr.Construct (((mutind, _), index), univ) -> 
       (* TODO get name of constructor -> get the type, extract ind there *)
       Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
-      (* let ty = constr_type c e sigma in
+      (* let ty = constr_type c e s in
       let ind_name = fst (fst (Inductive.find_inductive e ty)) in
       constructor_name e ind_name index *)
 (* TODO remove warnings *)
   | Constr.Case (ci, constr, inv, scr, arr) -> 
     let ind_info = snd (Inductive.lookup_mind_specif e (ci.Constr.ci_ind)) in
     let ind_name = Names.MutInd.to_string (fst ci.Constr.ci_ind) in
-    let scr_str = constr_to_z3 scr e  sigma in 
+    let scr_str = constr_to_z3 scr e  s in 
     let branch_to_z3 (index: int) (body: Constr.t) : string =
       begin
         (* constructor arg count and name *)
@@ -702,7 +702,7 @@ let rec constr_to_z3 (c: Constr.t)
                     let la = Context.Named.Declaration.LocalAssum (ba, t) in
                     Environ.push_named la r)
                   names_types e in
-        let body_no_lams_str = constr_to_z3 body_no_lams e' sigma in
+        let body_no_lams_str = constr_to_z3 body_no_lams e' s in
         "(" ^ pattern ^ " " ^ body_no_lams_str ^ ")"
       end
     in
@@ -724,9 +724,10 @@ let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) li
   | _ -> ([], c)
 
 (* returns a def-fun-rec for a pending definition *)
-let define_pending (e: Environ.env)
-                   (sigma: Evd.evar_map)
-                   (p: pending_def) : string =
+let define_pending (s: Evd.evar_map)
+                   (e: Environ.env)
+                   (sct: z3script)
+                   (p: pending_def) : z3script =
   let (name, tys) = p in
   match (Environ.lookup_constant name e).Declarations.const_body with
   | Declarations.Def d -> 
@@ -763,19 +764,16 @@ let define_pending (e: Environ.env)
                 e in
       let _ = c2str types.(0) in
       let body_applied = Reduction.beta_applist body_fixvar_subst vars in
-      (*CoqInterface.warning "body" (c2str bodies.(0)) ; *)
-      CoqInterface.warning "body-applied'" (c2str body_applied) ;
-      (* CoqInterface.warning "vars" ("There are " ^ string_of_int (List.length vars) ^ " variables") ;*)
-      (*CoqInterface.warning "debug" (Pp.db_string_of_pp (Constr.debug_print body_applied));*)
       let bind_lst = List.map 
-        (fun (v, t) -> "(" ^ Names.Id.to_string (name_id_err v) ^ " " ^ constr_to_z3 t e sigma ^ ")")
+        (fun (v, t) -> "(" ^ Names.Id.to_string (name_id_err v) ^ " " ^ constr_to_z3 t e s ^ ")")
         (vars_types @ vars_types') in
       let binds_str = String.concat " " bind_lst in
-      "(define-fun-rec " ^ mono_name ^ " (" ^ binds_str ^ ") " ^ constr_to_z3 (return_type types.(0)) e sigma ^ " " ^ 
-      constr_to_z3 body_applied e sigma ^ ")"
+      let com = "(define-fun-rec " ^ mono_name ^ " (" ^ binds_str ^ ") " ^ constr_to_z3 (return_type types.(0)) e s ^ " " ^ 
+        constr_to_z3 body_applied e s ^ ")" in
+      {sct with funs = sct.funs @ [com]}
     | _ -> failwith "error"
     end
-  | _ -> ""
+  | _ -> failwith "error 2"
 
 let call_z3 (script: string) : Z3Syntax.z3answer =
     let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
@@ -833,34 +831,45 @@ let call_z3 (script: string) : Z3Syntax.z3answer =
       | Some r -> r
       | None -> CoqInterface.error ("z3 did not return a solution")
 
-let get_hyp_pending (sigma: Evd.evar_map)
+let get_hyp_pending  (s: Evd.evar_map)
                      (e: Environ.env)                     
                      hyp : pending_def list =
   match hyp with
   | Context.Named.Declaration.LocalAssum (hname, hyp_econstr) ->
-      pending_defs e sigma (EConstr.to_constr sigma hyp_econstr)
+      pending_defs s e (EConstr.to_constr s hyp_econstr)
   | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
 
 
-let hyp_to_z3_assert (sigma: Evd.evar_map)
-                     (e: Environ.env)                     
-                     hyp : string =
+let hyp_to_z3_assert (s: Evd.evar_map)
+                     (e: Environ.env)
+                     (sct: z3script)
+                     hyp : z3script =
   match hyp with
   | Context.Named.Declaration.LocalAssum (hname, hyp_econstr) ->
-      let hyp_ty = EConstr.to_constr sigma (snd (Typing.type_of e sigma hyp_econstr)) in
-      let hyp_constr = EConstr.to_constr sigma hyp_econstr in
+      let hyp_ty = EConstr.to_constr s (snd (Typing.type_of e s hyp_econstr)) in
+      let hyp_constr = EConstr.to_constr s hyp_econstr in
       let name_str = Names.Id.to_string (Context.binder_name hname) in
       
       if Constr.is_Prop hyp_ty then
-        "(assert " ^ constr_to_z3 hyp_constr e  sigma ^ ")"
+        let com = "(assert " ^ constr_to_z3 hyp_constr e  s ^ ")" in
+        {sct with asserts = sct.asserts @ [com]}
       
       else if Constr.is_Set hyp_constr || Constr.is_Type hyp_constr then
-        "(declare-sort " ^ name_str ^ ")"
+        let com = "(declare-sort " ^ name_str ^ ")" in
+        {sct with sorts = sct.sorts @ [com]}
 
       else
-        "(declare-const " ^ name_str ^ " " ^ constr_to_z3 hyp_constr e  sigma  ^ ")" 
+        let com = "(declare-const " ^ name_str ^ " " ^ constr_to_z3 hyp_constr e  s  ^ ")" in
+        {sct with vars = sct.vars @ [com]}
       
   | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
+
+let goal_to_z3_assert (s: Evd.evar_map)
+                      (e: Environ.env)
+                      (sct: z3script)
+                      c : z3script =
+  let com = "(assert (not " ^ constr_to_z3 c e s ^ "))" in 
+  {sct with asserts = sct.asserts @ [com]}
 
 let types_and_funcs () =
   "(declare-datatypes (T) (\n" ^
@@ -872,6 +881,15 @@ let types_and_funcs () =
        ")\n" ^
     ")\n" ^
 "))"
+
+let script_str (s: z3script) : string =
+  (* sorts >> funs >> vars >> asserts *)
+  let sorts = String.concat "\n" s.sorts in
+  let funs = String.concat "\n" s.funs in
+  let vars = String.concat "\n" s.vars in
+  let asserts = String.concat "\n" s.asserts in
+  types_and_funcs () ^ (* TODO remove *)
+  sorts ^ "\n" ^ funs ^ "\n" ^ vars ^ "\n" ^ asserts ^ "\n(check-sat)"
 
 let print_type () = 
   Proofview.Goal.enter (fun gl ->
@@ -891,15 +909,14 @@ let print_type () =
     (* TODO define interleave pending funs and hyps *)
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
-    let pending_hyps = List.concat_map (get_hyp_pending sigma env) hyps in
-    let pend = define_pending env sigma (List.hd pending_hyps) in
-    let goal_z3 = "(assert (not " ^ constr_to_z3 t env  sigma ^ "))" in 
-    let hyps_z3 = String.concat "\n" (List.map (hyp_to_z3_assert sigma env) (List.rev hyps)) in
-    let script = types_and_funcs () ^ "\n" ^ hyps_z3 ^ "\n" ^ pend ^ "\n" ^ goal_z3 ^ "\n(check-sat)" in
+    let pending_funs = List.concat_map (get_hyp_pending sigma env) hyps @ pending_defs sigma env t in
+    
+    let script : z3script = {asserts = []; vars = []; sorts = []; funs = []} in
+    let script = List.fold_right (fun c r -> hyp_to_z3_assert sigma env r c) (List.rev hyps) script in
+    let script = goal_to_z3_assert sigma env script t in
+    let script = List.fold_right (fun c r -> define_pending sigma env r c) pending_funs script in
 
-    (* sorts >> funs >> vars >> asserts *)
-
-    match call_z3 script with
+    match call_z3 (script_str script) with
     | Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat" ;  CoqInterface.tclIDTAC
     | Z3Syntax.Z3Sat -> CoqInterface.error ("z3 returned sat")
     | Z3Syntax.Z3Unknown -> CoqInterface.error ("z3 returned unknown")
