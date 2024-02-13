@@ -436,27 +436,57 @@ let split_inital_types (args: Constr.t list)
   | Some _ -> failwith "application of types (of non-polymorphic instantiation) not supported"
   | None -> (r1, r2)
 
-let rec ty_to_str (t: Constr.t) : string = 
-  match Constr.kind t with
-  | Constr.Ind ((n, _), _) -> Names.MutInd.to_string n
-  | Constr.Var id -> Names.Id.to_string id
-  | Constr.Const (n, _) -> Names.Constant.to_string n
-  | Constr.App (f, args) -> ty_to_str f ^ "_" ^ (String.concat "_" (List.map ty_to_str (Array.to_list args))) 
-  | Constr.Sort s -> begin match s with
-      | Sorts.SProp -> "SProp"
-      | Sorts.Prop -> "Prop"
-      | Sorts.Set -> "Set"
-      | Sorts.Type _ -> "Type"
-      end
-  | Constr.Prod _ -> failwith "grounded types only instantiation of polymorphic type"
-  | _ -> failwith "not expected construct for instantiation of polymorphic type"
+  let rec c2str (c: Constr.t) : string =
+    match Constr.kind c with
+    | Constr.Lambda (n, tn, t) -> 
+      let n_str = 
+        begin match (Context.binder_name n) with
+        | Names.Name.Anonymous -> "_"
+        | Names.Name.Name id -> Names.Id.to_string id
+        end in "Lambda(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")"
+    | Constr.Prod (n, tn, t) -> 
+      let n_str = 
+        begin match (Context.binder_name n) with
+        | Names.Name.Anonymous -> "_"
+        | Names.Name.Name id -> Names.Id.to_string id
+        end in "Prod(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")" 
+    | Constr.LetIn (n, v, tn, t) -> 
+      let n_str = 
+        begin match (Context.binder_name n) with
+        | Names.Name.Anonymous -> "_"
+        | Names.Name.Name id -> Names.Id.to_string id
+        end in "LetIn(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str v ^ ", " ^ c2str t ^ ")"
+  
+    | Constr.Var id -> Names.Id.to_string id
+    | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind 
+    | Constr.Const (name, univ) -> Names.Constant.to_string name
+    | Constr.Construct (((mutind, _), index), _) -> Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
+    | Constr.Rel i -> "Rel(" ^ string_of_int i ^ ")"
+    | Constr.App (f, arr) -> "(" ^ c2str f ^ " " ^ String.concat " " (List.map c2str (Array.to_list arr)) ^ ")"
+    | Constr.Case (_, _, _, scr, arr) -> "Match (" ^ c2str scr ^ ", (" ^ String.concat ", " (List.map c2str (Array.to_list arr)) ^ "))"
+    | Constr.Meta _ | Constr.Evar _ | Constr.Sort _ -> "spec"
+    | Constr.Fix _ -> "fix"
+    | _ -> "other"
+
 
 let monomorphic_name (name: string) (tys: Constr.types list) : string =
-  name ^ "_" ^ (String.concat "_" (List.map ty_to_str tys))
+  let rec ty_to_str_usc (t: Constr.t) : string = begin
+    match Constr.kind t with
+    | Constr.Ind ((n, _), _) -> Names.MutInd.to_string n
+    | Constr.Var id -> Names.Id.to_string id
+    | Constr.Const (n, _) -> Names.Constant.to_string n
+    | Constr.App (f, args) -> ty_to_str_usc f ^ "_" ^ (String.concat "_" (List.map ty_to_str_usc (Array.to_list args))) 
+    | Constr.Sort s -> begin match s with
+        | Sorts.SProp -> "SProp"
+        | Sorts.Prop -> "Prop"
+        | Sorts.Set -> "Set"
+        | Sorts.Type _ -> "Type"
+        end
+    | Constr.Prod _ -> failwith ("grounded types only instantiation of polymorphic type: " ^ c2str t)
+    | _ -> failwith "not expected construct for instantiation of polymorphic type" 
+  end in
+  name ^ "_" ^ (String.concat "_" (List.map ty_to_str_usc tys))
 
-(* error if one of poly args is not Ind - to simplify things *)
-(* let gen_mono_name (poly_name: string) (poly_args: Constr.t list) : string =
-  poly_name ^ "_" ^ String.concat "_" (List.map ty_to_str poly_args) *)
 
 let _constructor_name (e: Environ.env) (n: Names.inductive) (i: int) : string =
   let ind_info = snd (Inductive.lookup_mind_specif e n) in
@@ -476,7 +506,9 @@ else match Constr.kind c with
 
 (* name of constant and list of types for monomorphization
    e.g. (app, [A]) -> get a version of app for A, called app_A *)
-type pending_def = Names.Constant.t * (Constr.t list) 
+type pending_def = | Funct of (Names.Constant.t * (Constr.t list))
+                   | Indct of Names.inductive
+
 let rec pending_defs (s: Evd.evar_map)
                      (e: Environ.env) 
                      (c: Constr.t)  : pending_def list =
@@ -497,14 +529,18 @@ let rec pending_defs (s: Evd.evar_map)
             end
           | _ -> failwith "Expected inductive in the place of a Prop"
           end
-        else if Constr.isInd f then []
-        (* if f returns a type which is a Set, e.g. nat, list nat*)
         else 
-          let (tys, _) = split_inital_types args e s in 
-          match Constr.kind f with
-          | Constr.Const (name, _) -> [(name, tys)]
-          | _ -> pending_defs s e f
-      end in f_pending @ List.concat_map (pending_defs s e) (Array.to_list arr)
+          begin match Constr.kind f with
+          (* if f returns a type which is a Set, e.g. nat, list nat*)
+          | Constr.Ind (iname, _) -> [Indct iname]
+          | _ ->  
+            let (tys, _) = split_inital_types args e s in 
+            begin match Constr.kind f with
+            | Constr.Const (name, _) -> [Funct (name, tys)]
+            | _ -> pending_defs s e f
+            end
+          end
+        end in f_pending @ List.concat_map (pending_defs s e) (Array.to_list arr)
   | Constr.Prod (_, t1, t2) ->
     (pending_defs s e t1) @ (pending_defs s e t2)
   | Constr.LetIn (_, t1, tn, t2) ->
@@ -514,39 +550,6 @@ let rec pending_defs (s: Evd.evar_map)
     | Constr.Case (_, _, _, scr, arr) -> 
       pending_defs s e scr @ List.concat_map (pending_defs s e) (Array.to_list arr)
   | _ -> []
-(* FIXME to delete *)
-let rec c2str (c: Constr.t) : string =
-  match Constr.kind c with
-  | Constr.Lambda (n, tn, t) -> 
-    let n_str = 
-      begin match (Context.binder_name n) with
-      | Names.Name.Anonymous -> "_"
-      | Names.Name.Name id -> Names.Id.to_string id
-      end in "Lambda(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")"
-  | Constr.Prod (n, tn, t) -> 
-    let n_str = 
-      begin match (Context.binder_name n) with
-      | Names.Name.Anonymous -> "_"
-      | Names.Name.Name id -> Names.Id.to_string id
-      end in "Prod(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str t ^ ")" 
-  | Constr.LetIn (n, v, tn, t) -> 
-    let n_str = 
-      begin match (Context.binder_name n) with
-      | Names.Name.Anonymous -> "_"
-      | Names.Name.Name id -> Names.Id.to_string id
-      end in "LetIn(" ^ n_str ^ ", " ^ c2str tn ^ ", " ^ c2str v ^ ", " ^ c2str t ^ ")"
-
-  | Constr.Var id -> Names.Id.to_string id
-  | Constr.Ind ((mutind, _), univ) -> Names.MutInd.to_string mutind 
-  | Constr.Const (name, univ) -> Names.Constant.to_string name
-  | Constr.Construct (((mutind, _), index), _) -> Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
-  | Constr.Rel i -> "Rel(" ^ string_of_int i ^ ")"
-  | Constr.App (f, arr) -> "(" ^ c2str f ^ " " ^ String.concat " " (List.map c2str (Array.to_list arr)) ^ ")"
-  | Constr.Case (_, _, _, scr, arr) -> "Match (" ^ c2str scr ^ ", (" ^ String.concat ", " (List.map c2str (Array.to_list arr)) ^ "))"
-  | Constr.Meta _ | Constr.Evar _ | Constr.Sort _ -> "spec"
-  | Constr.Fix _ -> "fix"
-  | _ -> "other"
-
 
 let declare_var (e: Environ.env) (id: Names.Id.t) (t: Constr.types) : Environ.env =  
   let ba = { Context.binder_name = id
@@ -571,7 +574,8 @@ let name_id_err (n: Names.Name.t) : Names.Id.t =
 type z3script = { sorts : string list 
                 ; vars : string list
                 ; asserts : string list
-                ; funs : string list}
+                ; funs : string list
+                ; types : string list}
 
 (* converts a constr to Z3 expression *)
 let rec constr_to_z3 (c: Constr.t) 
@@ -660,10 +664,10 @@ let rec constr_to_z3 (c: Constr.t)
       "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
   | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
-      let name_str = Names.MutInd.to_string mutind in 
+      let name_str =  z3_name (Names.MutInd.to_string mutind) in 
       Option.default name_str (M.find_opt name_str special_inductives)
   | Constr.Const (name, univ) -> 
-      let name_str = Names.Constant.to_string name in
+      let name_str = z3_name (Names.Constant.to_string name) in
       begin match (Environ.lookup_constant name e).Declarations.const_body with
       | Declarations.Def d ->
           Option.default name_str (M.find_opt name_str special_funcs)
@@ -671,7 +675,7 @@ let rec constr_to_z3 (c: Constr.t)
       end
   | Constr.Construct (((mutind, _), index), univ) -> 
       (* TODO get name of constructor -> get the type, extract ind there *)
-      Names.MutInd.to_string mutind ^ "_c" ^ string_of_int index
+      z3_name (Names.MutInd.to_string mutind) ^ "_c" ^ string_of_int index
       (* let ty = constr_type c e s in
       let ind_name = fst (fst (Inductive.find_inductive e ty)) in
       constructor_name e ind_name index *)
@@ -684,7 +688,7 @@ let rec constr_to_z3 (c: Constr.t)
       begin
         (* constructor arg count and name *)
         let args_count = (ind_info.Declarations.mind_consnrealargs).(index) in
-        let c_name = ind_name ^ "_c" ^ string_of_int (index + 1) in
+        let c_name = z3_name ind_name ^ "_c" ^ string_of_int (index + 1) in
         (* get pattern variables and types *)
         let names_types = extract_lambdas_types args_count body in
         (* wildcards are not expected in lambdas that define branches *)
@@ -709,7 +713,13 @@ let rec constr_to_z3 (c: Constr.t)
     let brs_indices = List.init (Array.length arr) (fun x -> x) in
     let brs_strs = List.map (fun (a, b) -> branch_to_z3 a b) (List.combine brs_indices (Array.to_list arr)) in 
     "(match " ^ scr_str ^ " (" ^ String.concat "\n" brs_strs ^ "))"
-  | Constr.Rel _ -> failwith "free rel found"
+  | Constr.Rel i -> 
+    begin match Environ.lookup_rel i e with
+    | Context.Rel.Declaration.LocalAssum (bind, _) ->
+      Names.Id.to_string (name_id_err (Context.binder_name bind))
+    | Context.Rel.Declaration.LocalDef _ -> 
+      failwith "local definitions in rel"
+    end
   | Constr.Fix _ -> failwith ("evaluation of apps of fixpoints not supported yet")
   | Constr.Sort _ -> "(sort)"
   | _ -> failwith "Conversion not supported"
@@ -724,11 +734,11 @@ let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) li
   | _ -> ([], c)
 
 (* returns a def-fun-rec for a pending definition *)
-let define_pending (s: Evd.evar_map)
-                   (e: Environ.env)
-                   (sct: z3script)
-                   (p: pending_def) : z3script =
-  let (name, tys) = p in
+let define_func (s: Evd.evar_map)
+                (e: Environ.env)
+                (sct: z3script)
+                (name: Names.Constant.t)
+                (tys: Constr.t list) : z3script =
   match (Environ.lookup_constant name e).Declarations.const_body with
   | Declarations.Def d -> 
     (* typically, a fixpoint definition is fun (A: Type) fun (p1: ty1) ... fix recname fun(p_k+1: ty)... def*)
@@ -762,7 +772,6 @@ let define_pending (s: Evd.evar_map)
                 (fun (name, ty) r -> declare_var r (name_id_err name) ty)
                 (vars_types' @ [((Names.Name.Name (Names.Id.of_string mono_name), types.(0)))])
                 e in
-      let _ = c2str types.(0) in
       let body_applied = Reduction.beta_applist body_fixvar_subst vars in
       let bind_lst = List.map 
         (fun (v, t) -> "(" ^ Names.Id.to_string (name_id_err v) ^ " " ^ constr_to_z3 t e s ^ ")")
@@ -774,6 +783,112 @@ let define_pending (s: Evd.evar_map)
     | _ -> failwith "error"
     end
   | _ -> failwith "error 2"
+
+(* TODO should receive the mind_specif *)
+let extract_signature (s: Evd.evar_map)
+                      (e: Environ.env)
+                      (ind_name: string)
+                      (rc: Constr.rel_context)
+                      (t: Constr.types) : string list =
+  let ind_id = Names.Id.of_string ind_name in
+  let fake_id = Names.Id.of_string "fake_var" in
+  let fake_name = Names.Name.Name fake_id in
+  let fake_bind = { Context.binder_name = fake_name
+                  ; Context.binder_relevance = Sorts.Relevant} in
+  let _fake_var = Constr.mkVar fake_id in
+  let fake_ty = Constr.mkSet in
+  let rec skip_poly_prods (t: Constr.types): Constr.types = begin
+    match Constr.kind t with
+    | Constr.Prod (n, u, t') 
+      when Constr.is_Type u || Constr.is_Set u ->
+        begin match Context.binder_name n with
+        | Names.Name.Anonymous -> skip_poly_prods t'
+        | Names.Name.Name id -> 
+          let replaced = Reduction.beta_app 
+            (Constr.mkLambda (fake_bind, fake_ty, t')) 
+            (Constr.mkVar id) in
+          skip_poly_prods replaced
+        end
+    | _ -> t
+  end in
+  let rec ty_to_str (t: Constr.t) : string = begin
+    match Constr.kind t with
+    | Constr.Ind ((n, _), _) -> Names.MutInd.to_string n
+    | Constr.Var id -> Names.Id.to_string id
+    | Constr.Const (n, _) -> Names.Constant.to_string n
+    | Constr.App (f, args) -> "(" ^ ty_to_str f ^ " " ^ (String.concat " " (List.map ty_to_str (Array.to_list args))) ^ ")"
+    | Constr.Sort s -> begin match s with
+        | Sorts.SProp -> "SProp"
+        | Sorts.Prop -> "Prop"
+        | Sorts.Set -> "Set"
+        | Sorts.Type _ -> "Type"
+        end
+    | Constr.Prod _ -> failwith ("grounded types only instantiation of polymorphic type: " ^ c2str t)
+    | _ -> failwith "not expected construct for instantiation of polymorphic type" 
+  end in
+  let rec decomp_arr (t: Constr.types) : string list = begin
+    match Constr.kind t with
+    | Constr.Prod (n, t1, t2) ->
+      (* arrow *)
+      if Names.Name.is_anonymous (Context.binder_name n) then
+        ty_to_str t1 :: decomp_arr t2
+      else
+        failwith ("While extracting inductive type " ^ ind_name ^ ": not expected dependent type in constructor")
+    | _ -> [ty_to_str t]
+  end in 
+  (* the type of a constructor has a free rel that represents the 
+     recursive inductive type *)
+  let ind_var = Constr.mkVar ind_id in
+  let skipped = skip_poly_prods t in
+  let t_replaced_ind_rel = 
+    (* TODO use Environ.push_rel_context to avoid reducing lambdas;
+       in the case of ind list, it has A *)
+    Reduction.beta_app
+      (Constr.mkLambda (fake_bind, fake_ty, skipped))
+      ind_var in
+  decomp_arr t_replaced_ind_rel
+
+let define_ind (s: Evd.evar_map)
+               (e: Environ.env)
+               (sct: z3script)
+               (name: Names.inductive) : z3script =
+  let info = snd (Inductive.lookup_mind_specif e name) in
+  let rc = info.Declarations.mind_arity_ctxt in
+  let name_str = z3_name (Names.MutInd.to_string (fst name)) in
+  let ncons = Array.length info.Declarations.mind_consnames in
+  let construct_str (i: int) = begin
+    let c_arity = info.Declarations.mind_consnrealargs.(i) in
+    (* TODO remove variable c_name_str or change to constructors names *)
+    let _c_name_str = Names.Id.to_string (info.Declarations.mind_consnames.(i)) in 
+    if c_arity = 0 then
+      Printf.sprintf "%s_c%d" name_str (i+1)
+    else
+      let ty = info.Declarations.mind_user_lc.(i) in
+      let _ty2 = snd (info.Declarations.mind_nf_lc.(i)) in
+      let _relc = fst (info.Declarations.mind_nf_lc.(i)) in
+      let params = extract_signature s e name_str rc ty in
+      (* that last element is the return type*)
+      let params_inds = List.init (List.length params - 1) (fun x -> x) in
+      let params_strs = List.map 
+        (fun i' -> Printf.sprintf "(%s_c%d_s%d %s)" name_str (i+1) (i'+1) (List.nth params i'))
+        params_inds in
+      Printf.sprintf "(%s_c%d %s)" name_str (i+1) (String.concat " " params_strs)
+  end in 
+  let constrs_strs = List.map construct_str (List.init ncons (fun x -> x)) in
+  let polys_names = List.map (fun x -> Names.Id.to_string (name_id_err (Context.Rel.Declaration.get_name x))) rc in
+  let pars = String.concat " " polys_names in
+  let com = Printf.sprintf "(declare-datatype %s (par (%s) (%s)))" 
+    name_str pars (String.concat " " constrs_strs) in
+  {sct with types = sct.types @ [com]}
+
+let define_pending (s: Evd.evar_map)
+                   (e: Environ.env)
+                   (sct: z3script)
+                   (p: pending_def) : z3script =
+  match p with
+  | Funct (name, tys) -> define_func s e sct name tys
+  | Indct name -> define_ind s e sct name
+
 
 let call_z3 (script: string) : Z3Syntax.z3answer =
     let (filename, outchan) = Filename.open_temp_file "z3_coq" ".smt2" in
@@ -867,29 +982,23 @@ let hyp_to_z3_assert (s: Evd.evar_map)
 let goal_to_z3_assert (s: Evd.evar_map)
                       (e: Environ.env)
                       (sct: z3script)
-                      c : z3script =
+                      (c: Constr.t) : z3script =
   let com = "(assert (not " ^ constr_to_z3 c e s ^ "))" in 
   {sct with asserts = sct.asserts @ [com]}
 
-let types_and_funcs () =
-  "(declare-datatypes (T) (\n" ^
-    "(Coq.Init.Datatypes.list \n" ^
-	    "Coq.Init.Datatypes.list_c1 \n"  ^ 
-	    "(Coq.Init.Datatypes.list_c2 \n" ^
-            "(Coq.Init.Datatypes.list_c2_s1 T) \n" ^
-            "(Coq.Init.Datatypes.list_c2_s2 Coq.Init.Datatypes.list)\n" ^
-       ")\n" ^
-    ")\n" ^
-"))"
+module StringSet = Set.Make(String)
 
 let script_str (s: z3script) : string =
-  (* sorts >> funs >> vars >> asserts *)
-  let sorts = String.concat "\n" s.sorts in
-  let funs = String.concat "\n" s.funs in
-  let vars = String.concat "\n" s.vars in
-  let asserts = String.concat "\n" s.asserts in
-  types_and_funcs () ^ (* TODO remove *)
-  sorts ^ "\n" ^ funs ^ "\n" ^ vars ^ "\n" ^ asserts ^ "\n(check-sat)"
+  let dedup (l: string list) : string list = begin 
+    StringSet.elements (StringSet.of_list l)
+  end in
+  (* sorts >> funs >> vars >> asserts *)  
+  let sorts = String.concat "\n" (dedup s.sorts) in
+  let funs = String.concat "\n" (dedup s.funs) in
+  let vars = String.concat "\n" (dedup s.vars) in
+  let asserts = String.concat "\n" (dedup s.asserts) in
+  let types = String.concat "\n" (dedup s.types) in
+  Printf.sprintf "%s\n%s\n%s\n%s\n%s\n(check-sat)" types sorts funs vars asserts 
 
 let print_type () = 
   Proofview.Goal.enter (fun gl ->
@@ -911,7 +1020,7 @@ let print_type () =
     let hyps = Proofview.Goal.hyps gl in 
     let pending_funs = List.concat_map (get_hyp_pending sigma env) hyps @ pending_defs sigma env t in
     
-    let script : z3script = {asserts = []; vars = []; sorts = []; funs = []} in
+    let script : z3script = {asserts = []; vars = []; sorts = []; funs = []; types = []} in
     let script = List.fold_right (fun c r -> hyp_to_z3_assert sigma env r c) (List.rev hyps) script in
     let script = goal_to_z3_assert sigma env script t in
     let script = List.fold_right (fun c r -> define_pending sigma env r c) pending_funs script in
