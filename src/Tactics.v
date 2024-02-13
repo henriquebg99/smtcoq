@@ -32,6 +32,7 @@ in hyps_printer xs
 end 
 end.
 
+Tactic Notation "z3" := intros; z3_verify; admit.
 
 (** Collect all the hypotheses from the context *)
 
@@ -94,8 +95,6 @@ End Test.  *)
 Tactic Notation "verit_bool_base_auto" constr(h) := verit_bool_base h; try (exact _).
 Tactic Notation "verit_bool_no_check_base_auto" constr(h) := verit_bool_no_check_base h; try (exact _).
 
-Tactic Notation "z3_bool_base_auto" constr(h) := z3_bool_base h; try (exact _).
-
 Tactic Notation "verit_bool" constr(h) :=
   let tac :=
   ltac2:(h |- get_hyps_cont_ltac1
@@ -108,9 +107,6 @@ Tactic Notation "verit_bool" constr(h) :=
 
 Tactic Notation "verit_bool" :=
   ltac2:(get_hyps_cont_ltac1 ltac1:(hs |- verit_bool_base_auto hs; vauto)).
-
-Tactic Notation "z3_bool" :=
-  ltac2:(get_hyps_cont_ltac1 ltac1:(hs |- z3_bool_base_auto hs; vauto)).
 
 Tactic Notation "verit_bool_no_check" constr(h) :=
   let tac :=
@@ -185,17 +181,6 @@ Tactic Notation "verit" constr(h) :=
          [ .. | verit_bool_base_auto hs; vauto ]
   ]) h)) in tac h.
 
-
-Tactic Notation "z3" :=
-  ltac2:(intros ; get_hyps_cont_ltac1 ltac1:(Hs |-
-  add_compdecs Hs;
-  [ .. | prop2bool;
-         lazymatch Hs with
-         | Some ?Hs => prop2bool_hyps Hs
-         | None => idtac
-         end;
-         [ .. | verit_bool_base_auto Hs; vauto ]
-  ])).
 
 Tactic Notation "verit"           :=
   ltac2:(intros ; get_hyps_cont_ltac1 ltac1:(Hs |-

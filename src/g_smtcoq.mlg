@@ -126,7 +126,5 @@ TACTIC EXTEND Tactic_cvc4
 END
 
 TACTIC EXTEND Tactic_z3
-| [ "z3_bool_base" constr(lpl) ] -> { Z3.tactic' None lpl (get_lemmas ()) }
-(* | [ "z3_verify" ] -> { Z3.tactic' () } *)
-| [ "print_type" ] -> { Z3.print_type () }
+| [ "z3_verify" ] -> { Z3.verify () }
 END
