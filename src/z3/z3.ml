@@ -41,6 +41,9 @@ module M = Map.Make (String)
 let special_funcs = M.of_seq (List.to_seq [
 ])
 
+let special_props : ((Environ.env -> Evd.evar_map -> Constr.t list -> string) M.t) ref =
+  ref M.empty
+
 (* extract return type of a type, expects Sort, Ind, Arrow. App (e.g. list nat), not dependent type *)
 let rec return_type (t: Constr.types) : Constr.types =
   match Constr.kind t with
@@ -178,7 +181,14 @@ let rec constr_to_z3 (c: Constr.t)
         match Constr.kind f with
         | Constr.Const (name, _) -> 
           let name_str = Names.Constant.to_string name in
-          begin match (M.find_opt name_str special_props) with
+          begin match (M.find_opt name_str !special_props) with
+          (* found a special prop *)
+          | Some fn -> fn e s args
+          | None -> failwith "User-defined props not supported"
+          end
+          | Constr.Ind ((mutind, _), univ) -> 
+          let name_str = Names.MutInd.to_string mutind in 
+          begin match (M.find_opt name_str !special_props) with
           (* found a special prop *)
           | Some fn -> fn e s args
           | None -> failwith "User-defined props not supported"
@@ -260,14 +270,14 @@ let rec constr_to_z3 (c: Constr.t)
   | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
       let name_str = Names.MutInd.to_string mutind in 
-      begin match M.find_opt name_str special_props with
-      | Some _ -> failwith "special props should heve been processed directly in Constr.App"
+      begin match M.find_opt name_str !special_props with
+      | Some _ -> failwith ("[" ^ name_str ^ "]" ^ "special props should heve been processed directly in Constr.App")
       | None -> z3_name name_str
       end
   | Constr.Const (name, univ) -> 
       let name_str = Names.Constant.to_string name in
-      begin match M.find_opt name_str special_props with
-      | Some _ -> failwith "special props should heve been processed directly in Constr.App"
+      begin match M.find_opt name_str !special_props with
+      | Some _ -> failwith ("[" ^ name_str ^ "]" ^ "special props should heve been processed directly in Constr.App")
       | None ->
         begin match (Environ.lookup_constant name e).Declarations.const_body with
         | Declarations.Def d ->
@@ -326,72 +336,61 @@ let rec constr_to_z3 (c: Constr.t)
   | Constr.Sort _ -> "(sort)"
   | _ -> failwith "Conversion not supported"
 end
-and special_props : 
-  (Environ.env -> Evd.evar_map -> Constr.t list -> string) M.t = begin
-  M.of_seq (List.to_seq [
-  ("Coq.Init.Logic.eq", app_with_name "=");
-  ("Coq.Init.Logic.and", app_with_name "and");
-  ("Coq.Init.Logic.or", app_with_name "or");
-  ("Coq.Init.Logic.not", app_with_name "not");
-  ("Coq.Init.Logic.ex", app_with_name "exists");
-  ("Coq.Init.Logic.iff", app_with_name "iff")
-]) end 
-and app_with_name (n: string) 
-                  (e: Environ.env) 
-                  (s: Evd.evar_map) 
-                  (a: Constr.t list) : string = begin
-  let a' = remove_initial_types_non_props a e s in
-    sprintf "(%s %s)" n (String.concat " " 
-      (List.map (fun s e c -> constr_to_z3 c e s) a'))
-end
-and pending_defs (s: Evd.evar_map)
+
+let rec pending_defs (s: Evd.evar_map)
                  (e: Environ.env) 
-                 (c: Constr.t)  : pending_def list = begin
+                 (c: Constr.t)  : pending_def list =
   match Constr.kind c with
   | Constr.App (f, arr) -> 
   let f_ty = constr_type f e s in
   let f_ret_ty = return_type f_ty in
   let args = Array.to_list arr in
   let f_pending = begin
-  if Constr.is_Prop f_ret_ty then
-  (* we only support some built-in props - eq, and, or...*)
-  begin match Constr.kind f with
-  | Constr.Ind ((mutind, _), univ) -> 
-  let name_str = Names.MutInd.to_string mutind in 
-  begin match (M.find_opt name_str special_props) with
-  | None -> failwith "User-defined props not yet supported"
-  | Some _ -> []
-  end
-  | Constr.Const (name, _) -> 
-  let name_str = Names.Constant.to_string name in 
-  begin match (M.find_opt name_str special_props) with
-  | None -> failwith "Functions returning props not yet supported"
-  | Some _ -> []
-  end (* TODO support also Lambda, variables *)
-  | _ -> failwith "Expected inductive/constant in the place of a Prop"
-  end
-  else 
-  begin match Constr.kind f with
-  (* if f returns a type which is a Set, e.g. nat, list nat*)
-  | Constr.Ind (iname, _) -> [Indct iname]
-  | _ ->  
-  let (tys, _) = split_inital_types args e s in 
-  begin match Constr.kind f with
-  | Constr.Const (name, _) -> [Funct (name, tys)]
-  | _ -> pending_defs s e f
-  end
-  end
+    if Constr.is_Prop f_ret_ty then
+      (* we only support some built-in props - eq, and, or...*)
+      begin match Constr.kind f with
+      | Constr.Ind ((mutind, _), univ) -> 
+        let name_str = Names.MutInd.to_string mutind in 
+        begin match (M.find_opt name_str !special_props) with
+        | None -> failwith "User-defined props not yet supported"
+        | Some _ -> []
+        end
+      | Constr.Const (name, _) -> 
+        let name_str = Names.Constant.to_string name in 
+        begin match (M.find_opt name_str !special_props) with
+        | None -> failwith "Functions returning props not yet supported"
+        | Some _ -> []
+        end (* TODO support also Lambda, variables *)
+      | _ -> failwith "Expected inductive/constant in the place of a Prop"
+      end
+    else 
+      begin match Constr.kind f with
+      (* if f returns a type which is a Set, e.g. nat, list nat*)
+      | Constr.Ind (iname, _) -> [Indct iname]
+      | _ ->  
+        let (tys, _) = split_inital_types args e s in 
+        begin match Constr.kind f with
+        | Constr.Const (name, _) -> [Funct (name, tys)]
+        | _ -> pending_defs s e f
+        end
+      end
   end in f_pending @ List.concat_map (pending_defs s e) (Array.to_list arr)
-  | Constr.Prod (_, t1, t2) ->
-  (pending_defs s e t1) @ (pending_defs s e t2)
-  | Constr.LetIn (_, t1, tn, t2) ->
-  (pending_defs s e t1) @ (pending_defs s e t2) @ (pending_defs s e tn)
-  | Constr.Lambda (_, tn, t1) ->
-  (pending_defs s e t1) @ (pending_defs s e tn)
+  | Constr.Prod (n, tn, t1) ->
+    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+    let e' = Environ.push_rel ld e in
+    (pending_defs s e tn) @ (pending_defs s e' t1)
+  | Constr.LetIn (n, t1, tn, t2) ->
+    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+    let e' = Environ.push_rel ld e in
+    (pending_defs s e t1) @ (pending_defs s e' t2) @ (pending_defs s e tn)
+  | Constr.Lambda (n, tn, t1) ->
+    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+    let e' = Environ.push_rel ld e in
+    (pending_defs s e' t1) @ (pending_defs s e tn)
   | Constr.Case (_, _, _, scr, arr) -> 
   pending_defs s e scr @ List.concat_map (pending_defs s e) (Array.to_list arr)
   | _ -> []
-end
+
 
 (* TODO remove body from extract_... return type *)
 (* given \x1:t1 -> ... \xn:tn -> b returns ([(x1, t1), ..., (xn, tn)], b) *)
@@ -510,7 +509,7 @@ let extract_signature (s: Evd.evar_map)
   let ind_var = Constr.mkVar ind_id in
   let skipped = skip_poly_prods t in
   let t_replaced_ind_rel = 
-    (* TODO use Environ.push_rel_context to avoid reducing lambdas;
+    (* TODO use Environ.push_rel_context to avoid reducing lambdas; done in pendind_defs
        in the case of ind list, it has A *)
     Reduction.beta_app
       (Constr.mkLambda (fake_bind, fake_ty, skipped))
@@ -669,9 +668,48 @@ let script_str (s: z3script) : string =
   let types = String.concat "\n" (dedup s.types) in
   sprintf "%s\n%s\n%s\n%s\n%s\n(check-sat)" types sorts funs vars asserts 
 
+(* functons to process special props i.e. props that have
+   a match in z3 (=, exists, ...) *)
+
+let app_with_name (n: string) 
+                (e: Environ.env) 
+                (s: Evd.evar_map) 
+                (a: Constr.t list) : string =
+  let a' = remove_initial_types_non_props a e s in
+    sprintf "(%s %s)" n (String.concat " " 
+      (List.map (fun c -> constr_to_z3 c e s) a'))
+
+let handle_exists (e: Environ.env) 
+                  (s: Evd.evar_map) 
+                  (a: Constr.t list) : string =
+  let fn = List.nth a 1 in
+  match Constr.kind fn with
+  | Constr.Lambda (n, tn, t) -> 
+    begin match (Context.binder_name n) with
+    | Names.Name.Anonymous -> failwith "binding of exists cannot be anonymous"
+    | Names.Name.Name id -> 
+      let var = Constr.mkVar id in
+      (* TODO use push_rel_context instead of reduction s*)
+      let ex_body = Reduction.beta_app fn var in
+      let e' = declare_var e id tn in
+      sprintf "(exists ((%s %s)) %s)" 
+        (Names.Id.to_string id)
+        (constr_to_z3 tn e' s)
+        (constr_to_z3 ex_body e' s)
+    end
+  | _ -> failwith "second arguments of ex should be a lambda"
+  
+
 (* Tactic entry point *)
 let verify () = 
   Proofview.Goal.enter (fun gl ->
+    special_props := M.of_seq (List.to_seq [
+      ("Coq.Init.Logic.eq", app_with_name "=");
+      ("Coq.Init.Logic.and", app_with_name "and");
+      ("Coq.Init.Logic.or", app_with_name "or");
+      ("Coq.Init.Logic.not", app_with_name "not");
+      ("Coq.Init.Logic.ex", handle_exists);
+    ]) ; 
     
     (* envienvironment with global definitions, etc. *)
     let env = Proofview.Goal.env gl in
