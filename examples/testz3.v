@@ -21,6 +21,6 @@ Require Import Coq.Lists.List.
 (* Goal match 0 with 0 => False | S n => True end.
 Proof. print_type. *)
 
-Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
+Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 <> nil /\ l2 = nil.
 Proof. z3.
 Admitted.
