@@ -163,7 +163,7 @@ let name_id_err (n: Names.Name.t) : Names.Id.t =
 type z3script = { sorts : string list 
                 ; vars : string list
                 ; asserts : string list
-                ; funs : string list
+                ; funs : (string * string) list (*(header, body)*)
                 ; types : string list}
 
 (* converts a constr to Z3 expression *)
@@ -337,59 +337,74 @@ let rec constr_to_z3 (c: Constr.t)
   | _ -> failwith "Conversion not supported"
 end
 
-let rec pending_defs (s: Evd.evar_map)
-                 (e: Environ.env) 
-                 (c: Constr.t)  : pending_def list =
-  match Constr.kind c with
-  | Constr.App (f, arr) -> 
-  let f_ty = constr_type f e s in
-  let f_ret_ty = return_type f_ty in
-  let args = Array.to_list arr in
-  let f_pending = begin
-    if Constr.is_Prop f_ret_ty then
-      (* we only support some built-in props - eq, and, or...*)
-      begin match Constr.kind f with
-      | Constr.Ind ((mutind, _), univ) -> 
-        let name_str = Names.MutInd.to_string mutind in 
-        begin match (M.find_opt name_str !special_props) with
-        | None -> failwith "User-defined props not yet supported"
-        | Some _ -> []
-        end
-      | Constr.Const (name, _) -> 
-        let name_str = Names.Constant.to_string name in 
-        begin match (M.find_opt name_str !special_props) with
-        | None -> failwith "Functions returning props not yet supported"
-        | Some _ -> []
-        end (* TODO support also Lambda, variables *)
-      | _ -> failwith "Expected inductive/constant in the place of a Prop"
-      end
-    else 
-      begin match Constr.kind f with
-      (* if f returns a type which is a Set, e.g. nat, list nat*)
-      | Constr.Ind (iname, _) -> [Indct iname]
-      | _ ->  
-        let (tys, _) = split_inital_types args e s in 
+let pending_defs (s: Evd.evar_map)
+                  (e: Environ.env) 
+                  (cs: Constr.t list)  : pending_def list =
+  let pendings = Hashtbl.create 32 in
+  let rec pending_defs_aux (s: Evd.evar_map)
+                           (e: Environ.env) 
+                           (c: Constr.t) : unit =
+    match Constr.kind c with
+    | Constr.App (f, arr) -> 
+    let f_ty = constr_type f e s in
+    let f_ret_ty = return_type f_ty in
+    let args = Array.to_list arr in
+    begin
+      if Constr.is_Prop f_ret_ty then
+        (* we only support some built-in props - eq, and, or...*)
         begin match Constr.kind f with
-        | Constr.Const (name, _) -> [Funct (name, tys)]
-        | _ -> pending_defs s e f
+        | Constr.Ind ((mutind, _), univ) -> 
+          let name_str = Names.MutInd.to_string mutind in 
+          begin match (M.find_opt name_str !special_props) with
+          | None -> failwith "User-defined props not yet supported"
+          | Some _ -> ()
+          end
+        | Constr.Const (name, _) -> 
+          let name_str = Names.Constant.to_string name in 
+          begin match (M.find_opt name_str !special_props) with
+          | None -> failwith "Functions returning props not yet supported"
+          | Some _ -> ()
+          end (* TODO support also Lambda, variables *)
+        | _ -> failwith "Expected inductive/constant in the place of a Prop"
         end
-      end
-  end in f_pending @ List.concat_map (pending_defs s e) (Array.to_list arr)
-  | Constr.Prod (n, tn, t1) ->
-    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
-    let e' = Environ.push_rel ld e in
-    (pending_defs s e tn) @ (pending_defs s e' t1)
-  | Constr.LetIn (n, t1, tn, t2) ->
-    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
-    let e' = Environ.push_rel ld e in
-    (pending_defs s e t1) @ (pending_defs s e' t2) @ (pending_defs s e tn)
-  | Constr.Lambda (n, tn, t1) ->
-    let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
-    let e' = Environ.push_rel ld e in
-    (pending_defs s e' t1) @ (pending_defs s e tn)
-  | Constr.Case (_, _, _, scr, arr) -> 
-  pending_defs s e scr @ List.concat_map (pending_defs s e) (Array.to_list arr)
-  | _ -> []
+      else 
+        begin match Constr.kind f with
+        (* if f returns a type which is a Set, e.g. nat, list nat*)
+        | Constr.Ind (iname, _) -> 
+          Hashtbl.add pendings (Names.MutInd.to_string (fst iname)) (Indct iname)
+        | Constr.Const (name, _) -> 
+          let (tys, _) = split_inital_types args e s in 
+          let mono = monomorphic_name (Names.Constant.to_string name) tys in
+          if Hashtbl.mem pendings mono
+            then () 
+            else 
+              begin match (Environ.lookup_constant name e).Declarations.const_body with
+              | Declarations.Def d -> 
+                Hashtbl.add pendings mono (Funct (name, tys)) ;
+                let d = Mod_subst.force_constr d in
+                pending_defs_aux s e d
+              | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
+              end 
+          | _ -> pending_defs_aux s e f
+          end
+        end ; Array.iter (pending_defs_aux s e) arr
+    | Constr.Prod (n, tn, t1) ->
+      let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+      let e' = Environ.push_rel ld e in
+      (pending_defs_aux s e tn) ; (pending_defs_aux s e' t1)
+    | Constr.LetIn (n, t1, tn, t2) ->
+      let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+      let e' = Environ.push_rel ld e in
+      (pending_defs_aux s e t1) ; (pending_defs_aux s e' t2) ; (pending_defs_aux s e tn)
+    | Constr.Lambda (n, tn, t1) ->
+      let ld = Context.Rel.Declaration.LocalAssum (n, tn) in
+      let e' = Environ.push_rel ld e in
+      (pending_defs_aux s e' t1) ; (pending_defs_aux s e tn)
+    | Constr.Case (_, _, _, scr, arr) -> 
+      pending_defs_aux s e scr ; Array.iter (pending_defs_aux s e) arr
+    | _ -> ()
+  in List.iter (pending_defs_aux s e) cs ; 
+     Hashtbl.fold (fun _ v r -> v :: r) pendings []
 
 
 (* TODO remove body from extract_... return type *)
@@ -445,9 +460,9 @@ let define_func (s: Evd.evar_map)
         (fun (v, t) -> "(" ^ Names.Id.to_string (name_id_err v) ^ " " ^ constr_to_z3 t e s ^ ")")
         (vars_types @ vars_types') in
       let binds_str = String.concat " " bind_lst in
-      let com = "(define-fun-rec " ^ mono_name ^ " (" ^ binds_str ^ ") " ^ constr_to_z3 (return_type types.(0)) e s ^ " " ^ 
-        constr_to_z3 body_applied e s ^ ")" in
-      {sct with funs = sct.funs @ [com]}
+      let header_str = sprintf "(%s (%s) %s)" mono_name binds_str (constr_to_z3 (return_type types.(0)) e s) in
+      let body_str = constr_to_z3 body_applied e s in
+      {sct with funs = sct.funs @ [(header_str, body_str)]}
     | _ -> failwith "error"
     end
   | _ -> failwith "error 2"
@@ -614,14 +629,13 @@ let call_z3 (script: string) : Z3Syntax.z3answer =
       | Some r -> r
       | None -> CoqInterface.error ("z3 did not return a solution")
 
-let get_hyp_pending  (s: Evd.evar_map)
-                     (e: Environ.env)                     
-                     hyp : pending_def list =
+let hyp_constr (s: Evd.evar_map)
+               (e: Environ.env)                     
+               hyp : Constr.t =
   match hyp with
   | Context.Named.Declaration.LocalAssum (hname, hyp_econstr) ->
-      pending_defs s e (EConstr.to_constr s hyp_econstr)
+      EConstr.to_constr s hyp_econstr
   | Context.Named.Declaration.LocalDef _ -> failwith "LocalDef in hyps"
-
 
 let hyp_to_z3_assert (s: Evd.evar_map)
                      (e: Environ.env)
@@ -655,14 +669,28 @@ let goal_to_z3_assert (s: Evd.evar_map)
   {sct with asserts = sct.asserts @ [com]}
 
 module StringSet = Set.Make(String)
+module StringPairSet = Set.Make(
+  struct
+    type t = string * string
+    let compare (a1, a2) (b1, b2) = 
+      let c1 = String.compare a1 b1 in
+      if c1 = 0 then String.compare a2 b2 else c1
+  end
+)
 
 let script_str (s: z3script) : string =
   let dedup (l: string list) : string list = begin 
     StringSet.elements (StringSet.of_list l)
   end in
+  let dedup_pair (l: (string * string) list) : (string * string) list = begin
+    StringPairSet.elements (StringPairSet.of_list l)
+  end in
   (* sorts >> funs >> vars >> asserts *)  
   let sorts = String.concat "\n" (dedup s.sorts) in
-  let funs = String.concat "\n" (dedup s.funs) in
+  let dedupped_funs = dedup_pair s.funs in
+  let funs = sprintf "(define-funs-rec (%s) (%s))" 
+    (String.concat " " (List.map fst dedupped_funs))
+    (String.concat "\n" (List.map snd dedupped_funs)) in
   let vars = String.concat "\n" (dedup s.vars) in
   let asserts = String.concat "\n" (dedup s.asserts) in
   let types = String.concat "\n" (dedup s.types) in
@@ -726,12 +754,12 @@ let verify () =
     (* TODO define interleave pending funs and hyps *)
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
-    let pending_funs = List.concat_map (get_hyp_pending sigma env) hyps @ pending_defs sigma env t in
+    let pendings = pending_defs sigma env (t :: (List.map (hyp_constr sigma env) hyps)) in
     
     let script : z3script = {asserts = []; vars = []; sorts = []; funs = []; types = []} in
     let script = List.fold_right (fun c r -> hyp_to_z3_assert sigma env r c) (List.rev hyps) script in
     let script = goal_to_z3_assert sigma env script t in
-    let script = List.fold_right (fun c r -> define_pending sigma env r c) pending_funs script in
+    let script = List.fold_right (fun c r -> define_pending sigma env r c) pendings script in
 
     match call_z3 (script_str script) with
     | Z3Syntax.Z3Unsat -> CoqInterface.warning "z3" "z3 returned unsat" ;  CoqInterface.tclIDTAC

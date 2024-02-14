@@ -21,8 +21,12 @@ Require Import Coq.Lists.List.
 (* Goal match 0 with 0 => False | S n => True end.
 Proof. print_type. *)
 
+Goal forall n1 n2, n1 <> 0 -> n2 <> 0 -> n1 * n2 <> 0.
+intros. z3.
+
 Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> forall l3, l3 = l2 -> l3 = nil.
-z3.
-(*Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
+z3. Admitted.
+
+Goal forall A (l1: list A) l2, l1 ++ l2 = nil -> l1 = nil /\ l2 = nil.
 Proof. z3.
-Admitted.*)
+Admitted.
