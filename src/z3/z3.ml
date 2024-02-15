@@ -115,7 +115,9 @@ let monomorphic_name (name: string) (tys: Constr.types list) : string =
     | Constr.Prod _ -> failwith ("grounded types only instantiation of polymorphic type: " ^ c2str t)
     | _ -> failwith "not expected construct for instantiation of polymorphic type" 
   end in
-  name ^ "_" ^ (String.concat "_" (List.map ty_to_str_usc tys))
+  match tys with
+  | [] -> name
+  | _ -> name ^ "_" ^ (String.concat "_" (List.map ty_to_str_usc tys))
 
 
 let _constructor_name (e: Environ.env) (n: Names.inductive) (i: int) : string =
@@ -267,7 +269,8 @@ let rec constr_to_z3 (c: Constr.t)
       let tn' = constr_to_z3 tn e  s in
       let t1' = constr_to_z3 t1 e'  s in 
       "(lambda ((" ^ name ^ " " ^ tn' ^ ")) " ^ t1' ^ ")"
-  | Constr.Var id -> Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
+  | Constr.Var id -> 
+    Names.Id.to_string id (* TODO if it is not a function, get its definition and return *)
   | Constr.Ind ((mutind, _), univ) -> 
       let name_str = Names.MutInd.to_string mutind in 
       begin match M.find_opt name_str !special_props with
@@ -337,9 +340,19 @@ let rec constr_to_z3 (c: Constr.t)
   | _ -> failwith "Conversion not supported"
 end
 
+(* TODO remove body from extract_... return type *)
+(* given \x1:t1 -> ... \xn:tn -> b returns ([(x1, t1), ..., (xn, tn)], b) *)
+let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) list) * Constr.t =
+  match Constr.kind c with (* TODO rule out dependent types, which cannot be enconded in Z3*)
+  | Constr.Lambda (n, tn, t) -> 
+    let n' = Context.binder_name n in
+    let (l, b) = extract_lambdas_params t in ((n', tn) :: l, b)
+  | _ -> ([], c)
+
+(* TODO a lot of repeated code between pending_defs ad*)
 let pending_defs (s: Evd.evar_map)
-                  (e: Environ.env) 
-                  (cs: Constr.t list)  : pending_def list =
+                 (e: Environ.env) 
+                 (cs: Constr.t list)  : pending_def list =
   let pendings = Hashtbl.create 32 in
   let rec pending_defs_aux (s: Evd.evar_map)
                            (e: Environ.env) 
@@ -367,14 +380,16 @@ let pending_defs (s: Evd.evar_map)
           end (* TODO support also Lambda, variables *)
         | _ -> failwith "Expected inductive/constant in the place of a Prop"
         end
-      else 
+      else (* TODO porquê nested e não recursivo em f *) 
         begin match Constr.kind f with
         (* if f returns a type which is a Set, e.g. nat, list nat*)
         | Constr.Ind (iname, _) -> 
-          Hashtbl.add pendings (Names.MutInd.to_string (fst iname)) (Indct iname)
+          let mono = Names.MutInd.to_string (fst iname) in
+          if Hashtbl.mem pendings mono then () else 
+            Hashtbl.add pendings mono (Indct iname)
         | Constr.Const (name, _) -> 
           let (tys, _) = split_inital_types args e s in 
-          let mono = monomorphic_name (Names.Constant.to_string name) tys in
+          let mono = z3_name (monomorphic_name (Names.Constant.to_string name) tys) in
           if Hashtbl.mem pendings mono
             then () 
             else 
@@ -382,7 +397,7 @@ let pending_defs (s: Evd.evar_map)
               | Declarations.Def d -> 
                 Hashtbl.add pendings mono (Funct (name, tys)) ;
                 let d = Mod_subst.force_constr d in
-                pending_defs_aux s e d
+                pending_defs_funs s e d tys mono
               | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
               end 
           | _ -> pending_defs_aux s e f
@@ -402,19 +417,63 @@ let pending_defs (s: Evd.evar_map)
       (pending_defs_aux s e' t1) ; (pending_defs_aux s e tn)
     | Constr.Case (_, _, _, scr, arr) -> 
       pending_defs_aux s e scr ; Array.iter (pending_defs_aux s e) arr
+    | Constr.Ind (iname, _) -> 
+      let name = z3_name (Names.MutInd.to_string (fst iname)) in
+      if Hashtbl.mem pendings name then () else 
+        Hashtbl.add pendings name (Indct iname)
+    (* only constants that are not applied *)
+    | Constr.Const (name, _) -> 
+      let name' = z3_name (Names.Constant.to_string name) in
+      begin match (Environ.lookup_constant name e).Declarations.const_body with
+      | Declarations.Def d -> 
+        Hashtbl.add pendings name' (Funct (name, [])) ;
+        let d = Mod_subst.force_constr d in
+        pending_defs_aux s e d
+      | _ -> failwith ("definition for name " ^ Names.Constant.to_string name ^ " is not available")
+      end  
     | _ -> ()
+  (* specific for function definitions; tys are the polymorphic arguments*)
+  and pending_defs_funs (s: Evd.evar_map)
+                        (e: Environ.env) 
+                        (d: Constr.t)
+                        (tys: Constr.types list)
+                        (mono_name: string) : unit =
+    let mono_def = 
+      if List.length tys = 0 then d
+      else Reduction.beta_applist d tys in
+    (* now, we have fun (p1: ty1) ... fix recname fun(p_k+1: ty)... def *)
+    (* extract params up to fix *)
+    let (vars_types, body) = extract_lambdas_params mono_def in
+    let vars = List.map (fun vt -> Constr.mkVar (name_id_err (fst vt))) vars_types in
+    let e = List.fold_right 
+              (fun (name, ty) r -> declare_var r (name_id_err name) ty)
+              vars_types 
+              e in
+    let body_applied = Reduction.beta_applist mono_def vars in
+    (* now, we have fix recname fun(p_k+1: ty)... def *)
+    begin match Constr.kind body_applied with
+    (* recursive function *)
+    | Constr.Fix (_, (names, types, bodies)) -> 
+      (* replace rel of the recursive def *)
+      let body_fixvar_subst = 
+        Reduction.beta_app 
+          (Constr.mkLambda (names.(0), types.(0), bodies.(0)))
+          (Constr.mkVar (Names.Id.of_string mono_name)) in
+      let (vars_types', body) = extract_lambdas_params body_fixvar_subst in
+      let vars = List.map (fun vt -> Constr.mkVar (name_id_err (fst vt))) vars_types' in
+      let e = List.fold_right 
+                (fun (name, ty) r -> declare_var r (name_id_err name) ty)
+                (vars_types' @ [((Names.Name.Name (Names.Id.of_string mono_name), types.(0)))])
+                e in
+      let body_applied = Reduction.beta_applist body_fixvar_subst vars in
+      (* TODO need to lookup pending defs in function signature? *)
+      List.iter (fun (v, t) -> pending_defs_aux s e t) vars_types ;
+      List.iter (fun (v, t) -> pending_defs_aux s e t) vars_types' ;
+      pending_defs_aux s e body_applied 
+    | _ -> failwith "error"
+    end
   in List.iter (pending_defs_aux s e) cs ; 
      Hashtbl.fold (fun _ v r -> v :: r) pendings []
-
-
-(* TODO remove body from extract_... return type *)
-(* given \x1:t1 -> ... \xn:tn -> b returns ([(x1, t1), ..., (xn, tn)], b) *)
-let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) list) * Constr.t =
-  match Constr.kind c with (* TODO rule out dependent types, which cannot be enconded in Z3*)
-  | Constr.Lambda (n, tn, t) -> 
-    let n' = Context.binder_name n in
-    let (l, b) = extract_lambdas_params t in ((n', tn) :: l, b)
-  | _ -> ([], c)
 
 (* returns a def-fun-rec for a pending definition *)
 let define_func (s: Evd.evar_map)
@@ -466,6 +525,7 @@ let define_func (s: Evd.evar_map)
     | _ -> failwith "error"
     end
   | _ -> failwith "error 2"
+
 
 (* TODO should receive the mind_specif *)
 let extract_signature (s: Evd.evar_map)
@@ -560,8 +620,12 @@ let define_ind (s: Evd.evar_map)
   let constrs_strs = List.map construct_str (List.init ncons (fun x -> x)) in
   let polys_names = List.map (fun x -> Names.Id.to_string (name_id_err (Context.Rel.Declaration.get_name x))) rc in
   let pars = String.concat " " polys_names in
-  let com = sprintf "(declare-datatype %s (par (%s) (%s)))" 
-    name_str pars (String.concat " " constrs_strs) in
+  let com = 
+    match polys_names with
+    | [] -> 
+      sprintf "(declare-datatype %s (%s))" name_str (String.concat " " constrs_strs)
+    | _ -> sprintf "(declare-datatype %s (par (%s) (%s)))" 
+        name_str pars (String.concat " " constrs_strs) in
   {sct with types = sct.types @ [com]}
 
 let define_pending (s: Evd.evar_map)
@@ -675,8 +739,7 @@ module StringPairSet = Set.Make(
     let compare (a1, a2) (b1, b2) = 
       let c1 = String.compare a1 b1 in
       if c1 = 0 then String.compare a2 b2 else c1
-  end
-)
+  end)
 
 let script_str (s: z3script) : string =
   let dedup (l: string list) : string list = begin 
@@ -685,15 +748,26 @@ let script_str (s: z3script) : string =
   let dedup_pair (l: (string * string) list) : (string * string) list = begin
     StringPairSet.elements (StringPairSet.of_list l)
   end in
+  let replace (c: char) (swith: string) (s: string) : string =
+    String.concat swith (String.split_on_char c s) in
+  (* TODO improve substitution of utf symbols, for instance, 
+     generating freh replacements and check environ *)
+  let replacement_quote = string_of_int (Random.int 1024) in
+  let rpl_quotes (l: string list) : string list =
+    List.map (replace '\'' replacement_quote) l in
+  let rpl_quotes_pairs (l: (string * string) list) : (string * string) list =
+    List.map (fun (a, b) -> (replace '\'' replacement_quote a, 
+                             replace '\'' replacement_quote b)) l in
+
   (* sorts >> funs >> vars >> asserts *)  
-  let sorts = String.concat "\n" (dedup s.sorts) in
-  let dedupped_funs = dedup_pair s.funs in
+  let sorts = String.concat "\n" (rpl_quotes (dedup s.sorts)) in
+  let r_dedupped_funs = rpl_quotes_pairs (dedup_pair s.funs) in
   let funs = sprintf "(define-funs-rec (%s) (%s))" 
-    (String.concat " " (List.map fst dedupped_funs))
-    (String.concat "\n" (List.map snd dedupped_funs)) in
-  let vars = String.concat "\n" (dedup s.vars) in
-  let asserts = String.concat "\n" (dedup s.asserts) in
-  let types = String.concat "\n" (dedup s.types) in
+    (String.concat " " (List.map fst r_dedupped_funs))
+    (String.concat "\n" (List.map snd r_dedupped_funs)) in
+  let vars = String.concat "\n" (rpl_quotes (dedup s.vars)) in
+  let asserts = String.concat "\n" (rpl_quotes (dedup s.asserts)) in
+  let types = String.concat "\n" (rpl_quotes (dedup s.types)) in
   sprintf "%s\n%s\n%s\n%s\n%s\n(check-sat)" types sorts funs vars asserts 
 
 (* functons to process special props i.e. props that have
@@ -730,6 +804,7 @@ let handle_exists (e: Environ.env)
 
 (* Tactic entry point *)
 let verify () = 
+  Random.init 0 ; 
   Proofview.Goal.enter (fun gl ->
     special_props := M.of_seq (List.to_seq [
       ("Coq.Init.Logic.eq", app_with_name "=");
@@ -755,7 +830,6 @@ let verify () =
     (* get hypothesis *)
     let hyps = Proofview.Goal.hyps gl in 
     let pendings = pending_defs sigma env (t :: (List.map (hyp_constr sigma env) hyps)) in
-    
     let script : z3script = {asserts = []; vars = []; sorts = []; funs = []; types = []} in
     let script = List.fold_right (fun c r -> hyp_to_z3_assert sigma env r c) (List.rev hyps) script in
     let script = goal_to_z3_assert sigma env script t in
