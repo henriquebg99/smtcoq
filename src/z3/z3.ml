@@ -3,7 +3,10 @@
 (* henrique.b.guerra@tecnico.ulisboa.pt *)
 (* ************************************ *)
 open Printf
-
+(* TODO este encoding não funciona se tiver parametros não polimorficos antes do fix... isto porque na call recursiva, em Coq, só são chamados*)
+(* TODO type to z3: we do not support arrow types i.e. array in z3 *)
+(* TODO exclude props from arguments of inductive types and functions *)
+(* TODO quantification over proofs is not supported: forall p: P, Q -> q cannot use p... *)
 (* invariants: 
    split_while f l = (l1, l2) -> l1 ++ l2 = l /\ f a for a in l1 and (l2 = [] or not f (hd l2))*)
    let rec split_while (f: 'a -> bool) (l: 'a list) : ('a list) * ('a list) =
@@ -349,7 +352,8 @@ let rec extract_lambdas_params (c: Constr.t) : ((Names.Name.t * Constr.types) li
     let (l, b) = extract_lambdas_params t in ((n', tn) :: l, b)
   | _ -> ([], c)
 
-(* TODO a lot of repeated code between pending_defs ad*)
+(* TODO a lot of repeated code between pending_defs and constr_to_z3; 
+   pass a pending_def list ref to constr, and remove pending_defs*)
 let pending_defs (s: Evd.evar_map)
                  (e: Environ.env) 
                  (cs: Constr.t list)  : pending_def list =
